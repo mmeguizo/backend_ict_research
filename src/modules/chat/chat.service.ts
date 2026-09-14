@@ -1,0 +1,2982 @@
+import { llmClient, type LlmMessage, type LlmStreamChunk } from "../../lib/llm-client";
+import { Prisma, NotificationType, Role } from "@prisma/client";
+import { config } from "../../config";
+import { logger } from "../../lib/logger";
+import { prisma } from "../../lib/prisma";
+import { solutionService } from "../solutions/solution.service";
+import { embeddingService } from "./embedding.service";
+
+/**
+ * Chat service that provides RAG-powered AI chat for ICT support.
+ *
+ * Flow:
+ * 1. User sends message
+ * 2. Service searches KB articles, resolved tickets, and troubleshooting solutions
+ * 3. Context + conversation history sent to Gemini
+ * 4. AI responds with knowledge-grounded answer
+ * 5. If no answer found, AI can guide ticket creation
+ */
+
+import { CHAT_PROMPT_VERSION } from "../ai/prompt-version";
+
+const CHAT_SYSTEM_PROMPT = `[Prompt v${CHAT_PROMPT_VERSION}] You are a friendly, expert AI support assistant for the CHMSU ICT Department help desk (Carlos Hilado Memorial State University).
+Your goal is to help users resolve ICT issues with accurate, personalized, and conversational troubleshooting guidance.
+
+TONE & STYLE (HUMAN-LIKE ALIGNMENT):
+- Speak like a helpful, experienced human support technician—be warm, empathetic, and professional.
+- Address the user by name naturally (e.g., "Hello Alice," or "No problem, Alice, let's look into that.") if their name is available in context.
+- AVOID robotic, rigid greeting formulas (like "Based on our official guidelines, here are...") or generic corporate platitudes (like "I would be happy to help you with that today!"). Talk naturally.
+- AVOID robotic headers such as "Proactive Tip:" or analytical labels like "Solution 1:". Weave these tips and alternative options smoothly into natural paragraphs or light, warm transitions (e.g., "A quick tip: you might also want to...").
+- Keep formatting clean and airy but fundamentally conversational. Do NOT use numbered lists or bullet points unless describing 4 or more sequential steps. For shorter processes, use simple, friendly paragraphs.
+
+CORE BEHAVIOR:
+- You are knowledgeable, proactive, and thorough. Give complete answers — never say "I don't know" if relevant context is provided.
+- Think step-by-step through problems. If the user's question is vague, infer the likely issue from context and ask a clarifying question.
+- Always provide actionable solutions, not just descriptions of the problem.
+- Be PROACTIVE: suggest next steps, related solutions, and preventive measures. Don't just answer — anticipate follow-up needs.
+
+ROLE-BASED ACCESS CONTROL:
+- Check the CURRENT USER section in context data for the user's role.
+- ADMIN: Full access — operational analytics, reports, and admin-only user directory answers. Chat is still read-only for destructive actions.
+- DEVELOPER / TECHNICAL / MIS_HEAD / ITS_HEAD / DIRECTOR / SECRETARY: Can access operational analytics and reports. Cannot access admin-only user directory lists or perform admin-level mutations.
+- USER (regular user): Can ONLY ask about troubleshooting, knowledge base solutions, their own ticket status, and create new tickets. Do NOT provide analytics, statistics, reports, or staff-level features to regular users. If they ask for analytics, politely explain that feature is available to ICT staff only.
+- If an ACCESS LEVEL restriction notice is in the context, strictly follow it.
+
+CONTEXT DATA RULES:
+1. ALWAYS check the provided CONTEXT DATA first (knowledge base articles, resolved tickets, troubleshooting solutions). This is your PRIMARY source of truth.
+2. When context data is provided, you MUST use it. Synthesize and present the information clearly — do not ignore it.
+3. Operational/admin context may include analytics, approval queues, workload, user summaries, knowledge coverage, or safety policy notes. Use that data directly and do not claim the system lacks context when those sections are present.
+4. When referencing a Knowledge Base article, include a clickable link: [KB: Article Title](kb:ARTICLE_ID) — replace ARTICLE_ID with the actual numeric ID (e.g., [KB: Reset Password](kb:12)). Do NOT add or prepend any 📖 emoji before the markdown link, as the system interface adds it automatically.
+5. When multiple context sources are relevant, combine them into a comprehensive answer.
+6. If NO relevant context is provided, use your general ICT knowledge confidently. Note: "Based on general ICT best practices:" before the answer.
+7. For issues requiring physical intervention (hardware failure, cable issues), suggest creating a support ticket.
+
+KNOWLEDGE PRIORITY:
+1. Knowledge Base articles (highest — curated solutions)
+2. Troubleshooting Solutions from resolved tickets (proven fixes)
+3. Resolved ticket history (past similar issues)
+4. General ICT knowledge (last resort, but still provide a useful answer)
+
+RESPONSE FORMAT:
+- Use markdown naturally: simple paragraphs, bold only for emphasis on key words, and code blocks for commands. Keep it simple and fluid.
+- Keep responses focused but comprehensive.
+- Only use numbered or bulleted lists for sequential step-by-step procedures when there are 4 or more steps. For shorter ones, use friendly conversational instruction.
+- End your troubleshooting suggestions with a natural, conversational offer to create a ticket (e.g., "If those steps don't resolve the issue, would you like me to open a support ticket for our team to take a hands-on look?").
+
+WHEN ASKED ABOUT TICKET STATUS:
+- Report status accurately from context: ticket number, status, assigned staff, recent updates.
+- If the user has multiple tickets, list them in a clear table format.
+- Include SLA information if available (overdue warnings, due dates).
+
+WHEN ASKED ABOUT ANALYTICS OR STATISTICS (staff/admin only):
+- Present data clearly with formatting (tables, bullet points, numbered lists).
+- Include totals, breakdowns by category/status/priority, and any notable insights.
+- Be accurate — only report numbers from the provided data.
+- Proactively highlight concerning metrics (high overdue count, increasing trend, etc.)
+- If SLA warnings are present in context, mention them.
+
+WHEN SAFETY POLICY DATA IS PROVIDED:
+- Explain the safeguard clearly and directly.
+- Make it explicit that chat is read-only for delete/deactivate/reassign actions.
+- If deletion is blocked, recommend the safer alternative (usually deactivation or reassignment).
+
+WHEN GUIDING TICKET CREATION — SENTIMENT DETECTION & MODES:
+
+DETECT UPSET / URGENT USERS:
+You MUST switch to URGENT MODE if the user sounds ANY of the following:
+- Angry, frustrated, impatient ("just fix it", "I don't have time for this", "stop asking me questions")
+- Demanding immediate action ("create the ticket now", "just create it", "open a ticket already")
+- Sending very short, terse messages or ALL-CAPS phrasing
+- Repeating demands more than once or ignoring your troubleshooting
+
+URGENT MODE (triggered by upset/urgent user):
+- IMPORTANT: Immediately STOP asking questions. Acknowledge their frustration warmly.
+- Responses MUST be under 2 sentences. Sound human, not robotic — e.g., "Understood — I'll get this ticket created for you right away."
+- After ONE short response, immediately output the ticket-data JSON block with what you have. Do NOT wait for more details.
+- Default type to ITS if unclear. Set priority to HIGH.
+- Category defaults to GENERAL if unclear.
+- ALWAYS include a staffNote field: "⚠️ Created via urgent chat — please clarify details with the user. Category, level, and description may need editing."
+- Example: "Understood, that sounds frustrating. I'll create your ticket now."
+  \`\`\`ticket-data
+  {"title": "Urgent Support Request", "description": "User said: 'nothing works' — details incomplete", "type": "ITS", "priority": "HIGH", "category": "GENERAL", "staffNote": "⚠️ Created via urgent chat — please clarify details with the user. Category, level, and description may need editing."}
+  \`\`\`
+
+NORMAL MODE (user is calm, conversational):
+- Guide ticket creation conversationally in a friendly manner (no numbered lists).
+- Ask 1-2 short questions at a time (max 3 total). Keep it conversational — don't interrogate.
+- Gather: problem description, affected device/system, timeline, impact scope.
+- After 2 exchanges without clear details, create the ticket anyway with a staff note explaining gaps.
+- Once you have enough, summarize warmly and output the ticket-data JSON block.
+- The ticket-data JSON block format:
+  \`\`\`ticket-data
+  {"title": "...", "description": "...", "type": "MIS or ITS", "priority": "LOW/MEDIUM/HIGH/CRITICAL", "category": "...", "staffNote": "..."}
+  \`\`\`
+- Staff note can be empty string "" if all details are clear, or explain what's missing (e.g., "User didn't specify device — staff should clarify model and location.")
+
+USER CONTEXT:
+- You may receive the current user's name, role, and other details. Use this to personalize responses.
+- Admins/staff may ask different questions than regular users — adjust detail level accordingly.
+- Address the user by name when appropriate for a personalized experience.
+
+CATEGORIES:
+- MIS (Management Information Systems): Website issues, software problems, system accounts
+  - Valid MIS categories: WEBSITE, SOFTWARE
+- ITS (Information Technology Services): Hardware, network, printer, device borrowing, connectivity
+
+WHEN ASKED FOR REPORTS (staff/admin only):
+- If report generation data is provided in context, present the download links exactly as shown.
+- Explain what each report contains and offer alternative report types.
+- If the user lacks permission, politely explain that report generation requires admin or staff role.
+
+SLA AWARENESS:
+- If SLA warning data is present in context, proactively mention it to staff/admin users.
+- For overdue tickets, suggest immediate attention and escalation.
+
+OUT-OF-SCOPE BEHAVIOR:
+- Only answer CHMSU ICT support questions that fit this system's capabilities: troubleshooting, knowledge-base lookups, ticket status, support ticket creation, and staff/admin operational analytics or reports when role allows it.
+- Do not answer general questions about weather, recipes, entertainment, politics, finance, medicine, homework, creative writing, or general trivia.
+- If a request is outside ICT scope, respond with a short redirect to ICT support topics and include this exact fenced block at the end:
+\`\`\`show-quick-options
+{}
+\`\`\`
+- If a request mixes ICT and non-ICT topics, answer only the ICT portion and ignore the rest.
+- Do not invent features, actions, reports, or permissions that are not explicitly supported by this system.`;
+
+const STAFF_ROLES = [
+  "ADMIN",
+  "DEVELOPER",
+  "TECHNICAL",
+  "MIS_HEAD",
+  "ITS_HEAD",
+  "DIRECTOR",
+  "SECRETARY",
+] as const;
+
+const SECRETARY_REVIEW_ACCESS_ROLES = [
+  "ADMIN",
+  "SECRETARY",
+  "MIS_HEAD",
+  "ITS_HEAD",
+] as const;
+
+const DIRECTOR_REVIEW_ACCESS_ROLES = [
+  "ADMIN",
+  "DIRECTOR",
+  "MIS_HEAD",
+  "ITS_HEAD",
+] as const;
+
+const ACTIVE_TICKET_STATUSES = [
+  "FOR_REVIEW",
+  "REVIEWED",
+  "DIRECTOR_APPROVED",
+  "ASSIGNED",
+  "PENDING",
+  "IN_PROGRESS",
+  "ON_HOLD",
+] as const;
+
+const EXCLUDED_OPERATIONAL_DATA_RESPONSE =
+  "I can answer operational questions from User, Ticket, TicketAssignment, TicketStatusHistory, MISTicket, ITSTicket, KnowledgeArticle, and TroubleshootingSolution data. I do not query notifications, chat history, attachments, ticket counters, or migration/internal tables in chat.";
+
+const QUICK_OPTIONS_BLOCK = "```show-quick-options\n{}\n```";
+
+const ICT_SCOPE_KEYWORDS =
+  /\b(ict|ticket|tickets|support|help\s*desk|knowledge\s*base|kb|printer|internet|network|wifi|wi-fi|password|account|software|hardware|computer|laptop|desktop|monitor|device|email|browser|server|database|website|portal|login|log\s*in|system|report|analytics|sla|approval|assignment|borrow|maintenance)\b/i;
+
+const OUT_OF_SCOPE_PATTERNS = [
+  /\b(weather|temperature|forecast|rain|sunny|storm|climate)\b/i,
+  /\b(recipe|recipes|cooking|ingredient|ingredients|bake|baking|chef|meal|cuisine)\b/i,
+  /\b(movie|movies|film|films|song|songs|music|celebrity|celebrities|sports|football|basketball)\b/i,
+  /\b(stock\s*market|bitcoin|crypto|cryptocurrency|invest|investing|trading)\b/i,
+  /\b(election|president|politician|politics|congress|senator|government|policy)\b/i,
+  /\b(doctor|diagnose|symptom|symptoms|medicine|prescription|hospital|medical)\b/i,
+  /\b(write\s+me\s+(a|an)?\s*(poem|essay|story|joke|riddle)|poem|essay|story|joke|riddle)\b/i,
+  /\b(capital\s+of|who\s+invented|history\s+of|explain\s+quantum|general\s+knowledge|trivia)\b/i,
+];
+
+export class ChatService {
+  isAvailable(): boolean {
+    return llmClient.isPerplexityAvailable() || llmClient.isGeminiAvailable();
+  }
+
+  private lastAiAlertTime = 0;
+
+  private async alertOnConsecutiveFailure(): Promise<void> {
+    const failures = llmClient.consecutiveFailures;
+    if (failures < 3) return;
+
+    const now = Date.now();
+    if (now - this.lastAiAlertTime < 3600000) return;
+    this.lastAiAlertTime = now;
+
+    const error = llmClient.lastError;
+    try {
+      const admins = await prisma.user.findMany({
+        where: { role: Role.ADMIN },
+        select: { id: true },
+      });
+      if (admins.length === 0) return;
+
+      for (const admin of admins) {
+        await prisma.notification.create({
+          data: {
+            userId: admin.id,
+            type: NotificationType.STATUS_CHANGED,
+            title: "⚠️ AI Provider Failure Alert",
+            message: `AI provider${error ? ` "${error.provider}"` : ""} has failed ${failures} times consecutively${error ? `: ${error.message}` : ""}. Last failure at ${error?.timestamp ? new Date(error.timestamp).toLocaleString() : "unknown"}.`,
+            metadata: {
+              consecutiveFailures: failures,
+              lastProvider: error?.provider || null,
+              lastError: error?.message || null,
+              lastTimestamp: error?.timestamp || null,
+            },
+          },
+        });
+      }
+      logger.warn(
+        `[ChatService] AI failure alert sent to ${admins.length} admin(s) (${failures} consecutive failures)`,
+      );
+    } catch (err: any) {
+      logger.error(`[ChatService] Failed to send AI failure alert: ${err.message}`);
+    }
+  }
+
+  // ========================================
+  // SESSION MANAGEMENT
+  // ========================================
+
+  async createSession(userId: number, title?: string) {
+    return prisma.chatSession.create({
+      data: {
+        userId,
+        title: title || "New Chat",
+      },
+    });
+  }
+
+  async getSessions(userId: number) {
+    return prisma.chatSession.findMany({
+      where: { userId },
+      orderBy: { updatedAt: "desc" },
+      include: {
+        _count: { select: { messages: true } },
+      },
+    });
+  }
+
+  /**
+   * Admin-only: get all chat sessions across all users
+   */
+  async getAllSessions() {
+    return prisma.chatSession.findMany({
+      orderBy: { updatedAt: "desc" },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            picture: true,
+          },
+        },
+        _count: { select: { messages: true } },
+      },
+    });
+  }
+
+  async getSession(sessionId: number, userId: number) {
+    const session = await prisma.chatSession.findUnique({
+      where: { id: sessionId },
+      include: {
+        messages: { orderBy: { createdAt: "asc" } },
+      },
+    });
+
+    if (!session || session.userId !== userId) {
+      throw new Error("Chat session not found");
+    }
+
+    return session;
+  }
+
+  async deleteSession(sessionId: number, userId: number) {
+    const session = await prisma.chatSession.findUnique({
+      where: { id: sessionId },
+    });
+    if (!session || session.userId !== userId) {
+      throw new Error("Chat session not found");
+    }
+    await prisma.chatSession.delete({ where: { id: sessionId } });
+    return true;
+  }
+
+  // ========================================
+  // CORE CHAT (RAG)
+  // ========================================
+
+  /**
+   * Send a message and get an AI response.
+   * This is the main entry point for the chat feature.
+   */
+  async sendMessage(
+    sessionId: number,
+    userId: number,
+    userMessage: string,
+  ): Promise<{ reply: string; metadata?: string; provider?: string }> {
+    // 1. Verify session ownership + get user info
+    const session = await prisma.chatSession.findUnique({
+      where: { id: sessionId },
+      include: {
+        messages: { orderBy: { createdAt: "asc" }, take: 20 },
+        user: { select: { name: true, role: true, email: true } },
+      },
+    });
+
+    if (!session || session.userId !== userId) {
+      throw new Error("Chat session not found");
+    }
+
+    // 2. Save user message
+    await prisma.chatMessage.create({
+      data: {
+        sessionId,
+        role: "USER",
+        content: userMessage,
+      },
+    });
+
+    const userRole = session.user?.role || "USER";
+
+    const helpResponse = this.checkHelpCommand(userMessage, userRole);
+    if (helpResponse) {
+      await this.persistAssistantReply(
+        sessionId,
+        helpResponse,
+        null,
+        session.messages.length,
+        userMessage,
+      );
+
+      return { reply: helpResponse };
+    }
+
+    const outOfScopeResponse = this.checkOutOfScopeQuery(userMessage, userRole);
+    if (outOfScopeResponse) {
+      await this.persistAssistantReply(
+        sessionId,
+        outOfScopeResponse,
+        null,
+        session.messages.length,
+        userMessage,
+      );
+
+      return { reply: outOfScopeResponse };
+    }
+
+    // 3. Check if this is a ticket status query
+    const ticketContext = await this.checkTicketStatusQuery(
+      userMessage,
+      userId,
+    );
+
+    // 3b. Role-gated: Analytics and report requests only for staff/admin
+    const isStaffOrAdmin = STAFF_ROLES.includes(userRole as any);
+
+    const analyticsRequest = await this.checkAnalyticsQuery(
+      userMessage,
+      userRole,
+    );
+    const reportRequest = this.checkReportRequest(userMessage, userRole);
+    const deletionPolicy = this.checkDeletionPolicyQuery(userMessage, userRole);
+
+    // Short-circuit: if the user is clearly asking for help/ticket creation, don't deny
+    const ticketCreationIntentPatterns = [
+      /\b(request|open|unlock|extend|create|submit|emergency|help|can i|please)\b/i,
+      /\bcreate\s+(a|new)?\s*ticket\b/i,
+    ];
+    const hasTicketCreationIntent = ticketCreationIntentPatterns.some((p) =>
+      p.test(userMessage),
+    );
+
+    if (
+      !isStaffOrAdmin &&
+      !ticketContext &&
+      !hasTicketCreationIntent &&
+      (analyticsRequest || reportRequest)
+    ) {
+      const denyReply =
+        "I'm sorry, but analytics and report generation are available only to ICT staff and administrators. " +
+        "I can still help with troubleshooting, knowledge base lookups, checking your ticket status, or creating a new support ticket.";
+
+      await this.persistAssistantReply(
+        sessionId,
+        denyReply,
+        null,
+        session.messages.length,
+        userMessage,
+      );
+
+      return { reply: denyReply };
+    }
+
+    const analyticsContext = isStaffOrAdmin ? analyticsRequest : null;
+    const reportContext = isStaffOrAdmin ? reportRequest : null;
+
+    // 3d. SLA context for staff/admin — proactive SLA awareness
+    const slaContext = isStaffOrAdmin
+      ? await this.getSLAContext(userMessage, userRole)
+      : null;
+
+    // 4. Search for relevant context (RAG — fulltext + vector)
+    const ragContext = await this.retrieveContext(userMessage);
+
+    // 5. Build context string
+    let contextStr = "";
+
+    // Add user context so AI knows who it's talking to
+    if (session.user) {
+      contextStr += `\n--- CURRENT USER ---\nName: ${session.user.name}\nRole: ${session.user.role}\n`;
+    }
+
+    if (ticketContext) {
+      contextStr += "\n--- TICKET STATUS DATA ---\n" + ticketContext + "\n";
+    }
+
+    if (analyticsContext) {
+      contextStr += "\n--- ANALYTICS DATA ---\n" + analyticsContext + "\n";
+    }
+
+    if (deletionPolicy) {
+      contextStr += "\n--- SAFETY POLICY ---\n" + deletionPolicy + "\n";
+    }
+
+    if (reportContext) {
+      contextStr += "\n--- REPORT GENERATION ---\n" + reportContext + "\n";
+    }
+
+    if (slaContext) {
+      contextStr += "\n--- SLA WARNINGS ---\n" + slaContext + "\n";
+    }
+
+    // For regular users, add a role restriction notice so the AI doesn't offer staff features
+    if (!isStaffOrAdmin) {
+      contextStr +=
+        "\n--- ACCESS LEVEL ---\nThis user has a regular USER role. Do NOT offer analytics, statistics, reports, or any admin/staff features. Only help with troubleshooting, knowledge base lookups, checking their own ticket status, and creating new tickets.\n";
+    }
+
+    if (ragContext.kbArticles.length > 0) {
+      contextStr += "\n--- KNOWLEDGE BASE ARTICLES ---\n";
+      for (const article of ragContext.kbArticles) {
+        contextStr += `[Article ID: ${article.id}] Title: ${article.title}\nCategory: ${article.category}\nContent: ${article.content.substring(0, 1500)}\nLink format: [KB: ${article.title}](kb:${article.id})\n\n`;
+      }
+    }
+
+    if (ragContext.resolvedTickets.length > 0) {
+      contextStr += "\n--- RESOLVED TICKETS (similar issues) ---\n";
+      for (const ticket of ragContext.resolvedTickets) {
+        contextStr += `Issue: ${ticket.title}\nDescription: ${ticket.description?.substring(0, 300) || "N/A"}\nResolution: ${ticket.resolution || "Resolved"}\n`;
+        if (ticket.notes) {
+          contextStr += `Notes:\n${ticket.notes.substring(0, 1200)}\n`;
+        }
+        contextStr += "\n";
+      }
+    }
+
+    if (ragContext.solutions.length > 0) {
+      contextStr += "\n--- TROUBLESHOOTING SOLUTIONS ---\n";
+      for (const sol of ragContext.solutions) {
+        contextStr += `Problem: ${sol.problem}\nSolution: ${sol.solution.substring(0, 500)}\nRelevance: ${sol.score ? `${(sol.score * 100).toFixed(0)}%` : "keyword match"}\n\n`;
+      }
+    }
+
+    // 6. Call LLM with context + conversation history
+    const startTime = Date.now();
+    const { reply, provider } = await this.callGemini(
+      session.messages,
+      userMessage,
+      contextStr,
+    );
+    const durationMs = Date.now() - startTime;
+
+    if (provider === "Offline") {
+      await this.alertOnConsecutiveFailure();
+    }
+
+    // 7. Save assistant reply
+    const metadata: any = {};
+    if (ragContext.kbArticles.length > 0)
+      metadata.kbArticleIds = ragContext.kbArticles.map((a: any) => a.id);
+    if (ragContext.resolvedTickets.length > 0)
+      metadata.ticketIds = ragContext.resolvedTickets.map((t: any) => t.id);
+    if (ragContext.solutions.length > 0)
+      metadata.solutionIds = ragContext.solutions.map((s: any) => s.id);
+    metadata.provider = provider || null;
+    metadata.durationMs = durationMs;
+    metadata.fallback = provider === "Offline";
+    metadata.promptVersion = CHAT_PROMPT_VERSION;
+
+    const metadataStr =
+      Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null;
+
+    await this.persistAssistantReply(
+      sessionId,
+      reply,
+      metadataStr,
+      session.messages.length,
+      userMessage,
+    );
+
+    return { reply, metadata: metadataStr || undefined, provider };
+  }
+
+  // ========================================
+  // STREAMING CHAT
+  // ========================================
+
+  /**
+   * Stream a chat message, yielding partial text chunks as they arrive from the LLM.
+   * Follows the same RAG flow as sendMessage() but yields chunks progressively.
+   * The complete reply is saved to the DB once streaming finishes.
+   */
+  async *streamChatMessage(
+    sessionId: number,
+    userId: number,
+    userMessage: string,
+  ): AsyncGenerator<{ chunk: string; done: boolean; provider?: string }> {
+    // 1. Verify session + get user info
+    const session = await prisma.chatSession.findUnique({
+      where: { id: sessionId },
+      include: {
+        messages: { orderBy: { createdAt: "asc" }, take: 20 },
+        user: { select: { name: true, role: true, email: true } },
+      },
+    });
+
+    if (!session || session.userId !== userId) {
+      throw new Error("Chat session not found");
+    }
+
+    // 2. Save user message
+    await prisma.chatMessage.create({
+      data: { sessionId, role: "USER", content: userMessage },
+    });
+
+    const userRole = session.user?.role || "USER";
+
+    // 3. Check for quick replies (help, out-of-scope) — these can return immediately
+    const helpResponse = this.checkHelpCommand(userMessage, userRole);
+    if (helpResponse) {
+      yield { chunk: helpResponse, done: true, provider: undefined };
+      await this.persistAssistantReply(sessionId, helpResponse, null, session.messages.length, userMessage);
+      return;
+    }
+
+    const outOfScopeResponse = this.checkOutOfScopeQuery(userMessage, userRole);
+    if (outOfScopeResponse) {
+      yield { chunk: outOfScopeResponse, done: true, provider: undefined };
+      await this.persistAssistantReply(sessionId, outOfScopeResponse, null, session.messages.length, userMessage);
+      return;
+    }
+
+    // 4. Ticket status query
+    const ticketContext = await this.checkTicketStatusQuery(userMessage, userId);
+    const isStaffOrAdmin = STAFF_ROLES.includes(userRole as any);
+    const analyticsRequest = await this.checkAnalyticsQuery(userMessage, userRole);
+    const reportRequest = this.checkReportRequest(userMessage, userRole);
+    const deletionPolicy = this.checkDeletionPolicyQuery(userMessage, userRole);
+
+    const ticketCreationIntentPatterns = [
+      /\b(request|open|unlock|extend|create|submit|emergency|help|can i|please)\b/i,
+      /\bcreate\s+(a|new)?\s*ticket\b/i,
+    ];
+    const hasTicketCreationIntent = ticketCreationIntentPatterns.some((p) => p.test(userMessage));
+
+    if (!isStaffOrAdmin && !ticketContext && !hasTicketCreationIntent && (analyticsRequest || reportRequest)) {
+      const denyReply =
+        "I'm sorry, but analytics and report generation are available only to ICT staff and administrators. " +
+        "I can still help with troubleshooting, knowledge base lookups, checking your ticket status, or creating a new support ticket.";
+      yield { chunk: denyReply, done: true, provider: undefined };
+      await this.persistAssistantReply(sessionId, denyReply, null, session.messages.length, userMessage);
+      return;
+    }
+
+    const analyticsContext = isStaffOrAdmin ? analyticsRequest : null;
+    const reportContext = isStaffOrAdmin ? reportRequest : null;
+    const slaContext = isStaffOrAdmin ? await this.getSLAContext(userMessage, userRole) : null;
+
+    // 5. RAG context retrieval (same as sendMessage)
+    const ragContext = await this.retrieveContext(userMessage);
+
+    // 6. Build context string
+    let contextStr = "";
+
+    if (session.user) {
+      contextStr += `\n--- CURRENT USER ---\nName: ${session.user.name}\nRole: ${session.user.role}\n`;
+    }
+    if (ticketContext) contextStr += "\n--- TICKET STATUS DATA ---\n" + ticketContext + "\n";
+    if (analyticsContext) contextStr += "\n--- ANALYTICS DATA ---\n" + analyticsContext + "\n";
+    if (deletionPolicy) contextStr += "\n--- SAFETY POLICY ---\n" + deletionPolicy + "\n";
+    if (reportContext) contextStr += "\n--- REPORT GENERATION ---\n" + reportContext + "\n";
+    if (slaContext) contextStr += "\n--- SLA WARNINGS ---\n" + slaContext + "\n";
+
+    if (!isStaffOrAdmin) {
+      contextStr +=
+        "\n--- ACCESS LEVEL ---\nThis user has a regular USER role. Do NOT offer analytics, statistics, reports, or any admin/staff features. Only help with troubleshooting, knowledge base lookups, checking their own ticket status, and creating new tickets.\n";
+    }
+
+    if (ragContext.kbArticles.length > 0) {
+      contextStr += "\n--- KNOWLEDGE BASE ARTICLES ---\n";
+      for (const article of ragContext.kbArticles) {
+        contextStr += `[Article ID: ${article.id}] Title: ${article.title}\nCategory: ${article.category}\nContent: ${article.content.substring(0, 1500)}\nLink format: [KB: ${article.title}](kb:${article.id})\n\n`;
+      }
+    }
+
+    if (ragContext.resolvedTickets.length > 0) {
+      contextStr += "\n--- RESOLVED TICKETS (similar issues) ---\n";
+      for (const ticket of ragContext.resolvedTickets) {
+        contextStr += `Issue: ${ticket.title}\nDescription: ${ticket.description?.substring(0, 300) || "N/A"}\nResolution: ${ticket.resolution || "Resolved"}\n`;
+        if (ticket.notes) contextStr += `Notes:\n${ticket.notes.substring(0, 1200)}\n`;
+        contextStr += "\n";
+      }
+    }
+
+    if (ragContext.solutions.length > 0) {
+      contextStr += "\n--- TROUBLESHOOTING SOLUTIONS ---\n";
+      for (const sol of ragContext.solutions) {
+        contextStr += `Problem: ${sol.problem}\nSolution: ${sol.solution.substring(0, 500)}\nRelevance: ${sol.score ? `${(sol.score * 100).toFixed(0)}%` : "keyword match"}\n\n`;
+      }
+    }
+
+    // 7. Stream LLM response
+    const messages: LlmMessage[] = [
+      { role: "system", content: CHAT_SYSTEM_PROMPT },
+      {
+        role: "assistant",
+        content: "Understood. I'm ready to help users with ICT support issues. I'll use the provided context data to give accurate answers and guide ticket creation when needed.",
+      },
+    ];
+
+    const recentHistory = session.messages.slice(-10);
+    for (const msg of recentHistory) {
+      messages.push({ role: msg.role === "USER" ? "user" : "assistant", content: msg.content });
+    }
+
+    let prompt = userMessage;
+    if (contextStr.trim()) {
+      prompt = `CONTEXT DATA (from our internal knowledge base and resolved tickets):\n${contextStr}\n\nUSER QUESTION: ${userMessage}`;
+    }
+    messages.push({ role: "user", content: prompt });
+
+    let fullReply = "";
+    let finalProvider: string | undefined;
+    const startTime = Date.now();
+
+    try {
+      const stream = llmClient.streamChatCompletion(messages, {
+        temperature: 0.4,
+        maxTokens: 4096,
+        topP: 0.9,
+      });
+
+      for await (const chunk of stream) {
+        // Skip empty finalization chunks
+        if (chunk.done && !chunk.text) continue;
+        fullReply += chunk.text;
+        finalProvider = chunk.provider;
+        yield { chunk: chunk.text, done: chunk.done, provider: chunk.provider };
+      }
+    } catch (err: any) {
+      logger.error(`[ChatService] Streaming LLM failed (${err.message}). Using fallback.`);
+      const fallbackText = this.fallbackResponse(userMessage, contextStr);
+      fullReply = fallbackText;
+      finalProvider = "Offline";
+      yield { chunk: fallbackText, done: true, provider: "Offline" };
+    }
+
+    if (finalProvider === "Offline") {
+      await this.alertOnConsecutiveFailure();
+    }
+
+    const durationMs = Date.now() - startTime;
+
+    // 8. Save complete assistant reply
+    const metadata: any = {};
+    if (ragContext.kbArticles.length > 0) metadata.kbArticleIds = ragContext.kbArticles.map((a: any) => a.id);
+    if (ragContext.resolvedTickets.length > 0) metadata.ticketIds = ragContext.resolvedTickets.map((t: any) => t.id);
+    if (ragContext.solutions.length > 0) metadata.solutionIds = ragContext.solutions.map((s: any) => s.id);
+    metadata.provider = finalProvider || null;
+    metadata.durationMs = durationMs;
+    metadata.fallback = finalProvider === "Offline";
+    metadata.promptVersion = CHAT_PROMPT_VERSION;
+
+    const metadataStr = Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null;
+    if (fullReply.trim()) {
+      await this.persistAssistantReply(sessionId, fullReply, metadataStr, session.messages.length, userMessage);
+    }
+  }
+
+  private async persistAssistantReply(
+    sessionId: number,
+    reply: string,
+    metadata: string | null,
+    existingMessageCount: number,
+    userMessage: string,
+  ) {
+    await prisma.chatMessage.create({
+      data: {
+        sessionId,
+        role: "ASSISTANT",
+        content: reply,
+        metadata,
+      },
+    });
+
+    if (existingMessageCount === 0) {
+      const title =
+        userMessage.length > 60
+          ? userMessage.substring(0, 57) + "..."
+          : userMessage;
+      await prisma.chatSession.update({
+        where: { id: sessionId },
+        data: { title },
+      });
+    }
+  }
+
+  // ========================================
+  // CONTEXT RETRIEVAL (RAG)
+  // ========================================
+
+  private async retrieveContext(query: string) {
+    // Extract meaningful keywords — filter out common stop words
+    const stopWords = new Set([
+      "the",
+      "a",
+      "an",
+      "is",
+      "are",
+      "was",
+      "were",
+      "be",
+      "been",
+      "being",
+      "have",
+      "has",
+      "had",
+      "do",
+      "does",
+      "did",
+      "will",
+      "would",
+      "could",
+      "should",
+      "may",
+      "might",
+      "can",
+      "shall",
+      "i",
+      "you",
+      "he",
+      "she",
+      "it",
+      "we",
+      "they",
+      "me",
+      "him",
+      "her",
+      "us",
+      "them",
+      "my",
+      "your",
+      "his",
+      "its",
+      "our",
+      "their",
+      "this",
+      "that",
+      "these",
+      "those",
+      "what",
+      "which",
+      "who",
+      "whom",
+      "how",
+      "when",
+      "where",
+      "why",
+      "not",
+      "no",
+      "nor",
+      "but",
+      "and",
+      "or",
+      "if",
+      "then",
+      "so",
+      "too",
+      "very",
+      "just",
+      "about",
+      "up",
+      "out",
+      "on",
+      "off",
+      "in",
+      "to",
+      "for",
+      "of",
+      "with",
+      "at",
+      "by",
+      "from",
+      "as",
+      "into",
+      "like",
+      "please",
+      "know",
+      "check",
+      "tell",
+      "show",
+      "many",
+      "much",
+      "any",
+      "some",
+    ]);
+
+    const keywords = query
+      .toLowerCase()
+      .split(/\s+/)
+      .map((k) => k.replace(/[^a-zA-Z0-9]/g, ""))
+      .filter((w) => w.length >= 3 && !stopWords.has(w))
+      .slice(0, 8);
+
+    const [kbArticles, resolvedTickets, fulltextSolutions, vectorSolutions] =
+      await Promise.all([
+        this.searchKBArticles(keywords),
+        this.searchResolvedTickets(keywords),
+        solutionService.searchForContext(query, 3),
+        embeddingService.searchSimilarSolutions(query, 3, 0.4),
+      ]);
+
+    // Merge fulltext + vector solutions, deduplicate by id
+    const seenIds = new Set<number>();
+    const solutions: any[] = [];
+
+    // Vector results first (higher quality matches)
+    for (const sol of vectorSolutions) {
+      if (!seenIds.has(sol.id)) {
+        seenIds.add(sol.id);
+        solutions.push(sol);
+      }
+    }
+    // Then fulltext results
+    for (const sol of fulltextSolutions) {
+      if (!seenIds.has(sol.id)) {
+        seenIds.add(sol.id);
+        solutions.push(sol);
+      }
+    }
+
+    return { kbArticles, resolvedTickets, solutions: solutions.slice(0, 5) };
+  }
+
+  private async searchKBArticles(keywords: string[]): Promise<any[]> {
+    if (keywords.length === 0) return [];
+
+    // Use OR-based search (any keyword match) for better recall
+    const searchTerms = keywords.join(" ");
+
+    try {
+      return await prisma.$queryRaw<any[]>`
+        SELECT id, title, content, category
+        FROM KnowledgeArticle
+        WHERE status = 'PUBLISHED'
+          AND MATCH(title, content) AGAINST(${searchTerms} IN BOOLEAN MODE)
+        ORDER BY MATCH(title, content) AGAINST(${searchTerms} IN BOOLEAN MODE) DESC
+        LIMIT 5
+      `;
+    } catch {
+      // Fallback to LIKE search
+      return prisma.knowledgeArticle.findMany({
+        where: {
+          status: "PUBLISHED",
+          OR: keywords.slice(0, 5).map((kw) => ({
+            OR: [{ title: { contains: kw } }, { content: { contains: kw } }],
+          })),
+        },
+        select: { id: true, title: true, content: true, category: true },
+        take: 5,
+      });
+    }
+  }
+
+  private async searchResolvedTickets(keywords: string[]): Promise<any[]> {
+    if (keywords.length === 0) return [];
+
+    // Use OR-based search for better recall
+    const searchTerms = keywords.join(" ");
+
+    try {
+      return await prisma.$queryRaw<any[]>`
+        SELECT t.id, t.title, t.description, t.resolution,
+          GROUP_CONCAT(CONCAT('Staff note: ', n.content) SEPARATOR '\n') AS notes
+        FROM Ticket t
+        LEFT JOIN TicketNote n ON n.ticketId = t.id
+        WHERE t.status IN ('RESOLVED', 'CLOSED')
+          AND t.resolution IS NOT NULL
+          AND MATCH(t.title, t.description) AGAINST(${searchTerms} IN BOOLEAN MODE)
+        GROUP BY t.id, t.title, t.description, t.resolution
+        ORDER BY MATCH(t.title, t.description) AGAINST(${searchTerms} IN BOOLEAN MODE) DESC
+        LIMIT 5
+      `;
+    } catch {
+      const tickets = await prisma.ticket.findMany({
+        where: {
+          status: { in: ["RESOLVED", "CLOSED"] },
+          resolution: { not: null },
+          OR: keywords.slice(0, 5).map((kw) => ({
+            OR: [
+              { title: { contains: kw } },
+              { description: { contains: kw } },
+            ],
+          })),
+        },
+        select: {
+          id: true,
+          title: true,
+          description: true,
+          resolution: true,
+          notes: {
+            orderBy: { createdAt: "asc" },
+            select: { content: true },
+          },
+        },
+        take: 5,
+      });
+
+      return tickets.map((ticket) => ({
+        ...ticket,
+        notes:
+          ticket.notes
+            ?.map((note) => `Staff note: ${note.content}`)
+            .join("\n") || null,
+      }));
+    }
+  }
+
+  // ========================================
+  // TICKET STATUS QUERY
+  // ========================================
+
+  private async checkTicketStatusQuery(
+    message: string,
+    userId: number,
+  ): Promise<string | null> {
+    // Check if the user is asking about a specific ticket
+    const ticketNumMatch = message.match(
+      /(?:ticket|#)\s*(\w{3,4}-\d{4}-\d{2}-\d+)/i,
+    );
+
+    if (ticketNumMatch) {
+      const ticketNumber = ticketNumMatch[1].toUpperCase();
+      const ticket = await prisma.ticket.findUnique({
+        where: { ticketNumber },
+        include: {
+          assignments: {
+            include: { user: { select: { name: true, role: true } } },
+          },
+          statusHistory: { orderBy: { createdAt: "desc" }, take: 3 },
+          notes: {
+            where: { isInternal: false },
+            orderBy: { createdAt: "desc" },
+            take: 5,
+            include: { user: { select: { name: true } } },
+          },
+        },
+      });
+
+      if (ticket && ticket.createdById === userId) {
+        return this.formatTicketStatus(ticket);
+      }
+    }
+
+    // Check if asking about "my tickets" / "my request" generally
+    const statusKeywords =
+      /\b(status|ticket|request|update|progress|where|track)\b/i;
+    if (statusKeywords.test(message)) {
+      const recentTickets = await prisma.ticket.findMany({
+        where: { createdById: userId },
+        orderBy: { createdAt: "desc" },
+        take: 3,
+        include: {
+          assignments: {
+            include: { user: { select: { name: true, role: true } } },
+          },
+          notes: {
+            where: { isInternal: false },
+            orderBy: { createdAt: "desc" },
+            take: 3,
+            include: { user: { select: { name: true } } },
+          },
+        },
+      });
+
+      if (recentTickets.length > 0) {
+        let status = "Here are your recent tickets:\n";
+        for (const t of recentTickets) {
+          const assigned =
+            t.assignments.map((a: any) => a.user.name).join(", ") ||
+            t.assignedDeveloperName ||
+            "Not yet assigned";
+          status += `- **${t.ticketNumber}**: ${t.title} — Status: **${t.status}** — Assigned to: ${assigned}\n`;
+          if (t.resolution) status += `  Resolution: ${t.resolution}\n`;
+          if ((t as any).notes?.length > 0) {
+            for (const note of (t as any).notes) {
+              status += `  Note by ${note.user.name}: ${note.content}\n`;
+            }
+          }
+        }
+        return status;
+      }
+
+      return "You do not have any recent support tickets yet. If you are currently experiencing an issue, I can help troubleshoot it or create a new support ticket for you.";
+    }
+
+    return null;
+  }
+
+  private formatTicketStatus(ticket: any): string {
+    const assigned =
+      ticket.assignments
+        ?.map((a: any) => `${a.user.name} (${a.user.role})`)
+        .join(", ") || "Not yet assigned";
+    const lastUpdate = ticket.statusHistory?.[0];
+
+    let status = `Ticket **${ticket.ticketNumber}**: ${ticket.title}\n`;
+    status += `- **Status**: ${ticket.status}\n`;
+    status += `- **Priority**: ${ticket.priority}\n`;
+    status += `- **Assigned to**: ${assigned}\n`;
+    if (ticket.assignedDeveloperName)
+      status += `- **Staff**: ${ticket.assignedDeveloperName}\n`;
+    if (ticket.dateToVisit)
+      status += `- **Date to Visit**: ${new Date(ticket.dateToVisit).toLocaleDateString()}\n`;
+    if (ticket.resolution) status += `- **Resolution**: ${ticket.resolution}\n`;
+    if (lastUpdate) {
+      status += `- **Last Update**: Changed from ${lastUpdate.fromStatus || "N/A"} to ${lastUpdate.toStatus} on ${new Date(lastUpdate.createdAt).toLocaleDateString()}\n`;
+    }
+    if (ticket.notes?.length > 0) {
+      status += `- **Notes**:\n`;
+      for (const note of ticket.notes) {
+        status += `  - ${note.user.name}: ${note.content}\n`;
+      }
+    }
+
+    return status;
+  }
+
+  // ========================================
+  // ANALYTICS QUERIES (READ-ONLY)
+  // ========================================
+
+  private async checkAnalyticsQuery(
+    message: string,
+    role: string = "USER",
+  ): Promise<string | null> {
+    const normalizedMessage = message.toLowerCase();
+
+    const excludedDataResponse =
+      this.checkExcludedOperationalQuery(normalizedMessage);
+    if (excludedDataResponse) {
+      return excludedDataResponse;
+    }
+
+    const supportedScopeResponse = this.checkOperationalCoverageQuery(
+      normalizedMessage,
+      role,
+    );
+    if (supportedScopeResponse) {
+      return supportedScopeResponse;
+    }
+
+    try {
+      const userContext = await this.buildUserQueryContext(message, role);
+      if (userContext) {
+        return userContext;
+      }
+
+      const approvalContext = await this.buildApprovalWorkflowContext(
+        message,
+        role,
+      );
+      if (approvalContext) {
+        return approvalContext;
+      }
+
+      const escalationContext = await this.buildEscalationContext(
+        message,
+        role,
+      );
+      if (escalationContext) {
+        return escalationContext;
+      }
+
+      const workloadContext = await this.buildWorkloadContext(message, role);
+      if (workloadContext) {
+        return workloadContext;
+      }
+
+      const categoryContext = await this.buildCategoryBreakdownContext(
+        message,
+        role,
+      );
+      if (categoryContext) {
+        return categoryContext;
+      }
+
+      const knowledgeContext = await this.buildKnowledgeCoverageContext(
+        message,
+        role,
+      );
+      if (knowledgeContext) {
+        return knowledgeContext;
+      }
+
+      return this.buildGeneralAnalyticsContext(message, role);
+    } catch (err: any) {
+      logger.error("[ChatService] Analytics query failed:", err.message);
+      return null;
+    }
+  }
+
+  private async buildGeneralAnalyticsContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    const normalizedMessage = message.toLowerCase();
+    const departmentScope = this.getDepartmentScope(role, message);
+    const analyticsWhere = departmentScope ? { type: departmentScope } : {};
+
+    const analyticsPatterns = [
+      /how many\s+(tickets?|requests?|issues?)/i,
+      /ticket.*\b(statistics?|analytics?|report|count|total|summary)\b/i,
+      /\b(statistics?|analytics?|report|summary|dashboard|overview)\b.*(ticket|request|issue)/i,
+      /most\s+(common|frequent|painful|problematic|recurring)/i,
+      /ticket.*(per|by)\s+(day|week|month|category|status|priority|type)/i,
+      /(average|mean|median).*(resolution|response|time)/i,
+      /\b(workload|performance|productivity)\b/i,
+      /(busiest|peak|slowest)\s*(day|time|period|month)/i,
+      /\b(sla|overdue|compliance|breach)\b.*\b(tickets?|requests?|count|report|status|rate|data)\b/i,
+      /\b(tickets?|requests?|count|report|status|rate|data)\b.*\b(sla|overdue|compliance|breach)\b/i,
+      /\bdeadline\b.*\b(tickets?|requests?|count|report|sla|compliance)\b/i,
+      /\b(unresolved|pending|backlog)\b.*\b(tickets?|requests?)\b/i,
+    ];
+
+    if (!analyticsPatterns.some((pattern) => pattern.test(normalizedMessage))) {
+      return null;
+    }
+
+    const results: string[] = [];
+
+    if (departmentScope) {
+      results.push(`**Analytics Scope**: ${departmentScope} tickets only`);
+    }
+
+    const statusCounts = await prisma.ticket.groupBy({
+      by: ["status"],
+      where: analyticsWhere,
+      _count: { id: true },
+    });
+    if (statusCounts.length > 0) {
+      results.push("**Tickets by Status:**");
+      const totalTickets = statusCounts.reduce(
+        (sum, statusEntry) => sum + statusEntry._count.id,
+        0,
+      );
+      results.push(`Total tickets: ${totalTickets}`);
+      for (const statusEntry of statusCounts) {
+        results.push(`- ${statusEntry.status}: ${statusEntry._count.id}`);
+      }
+    }
+
+    const typeCounts = await prisma.ticket.groupBy({
+      by: ["type"],
+      where: analyticsWhere,
+      _count: { id: true },
+    });
+    if (typeCounts.length > 0) {
+      results.push("\n**Tickets by Type:**");
+      for (const typeEntry of typeCounts) {
+        results.push(`- ${typeEntry.type}: ${typeEntry._count.id}`);
+      }
+    }
+
+    const priorityCounts = await prisma.ticket.groupBy({
+      by: ["priority"],
+      where: analyticsWhere,
+      _count: { id: true },
+    });
+    if (priorityCounts.length > 0) {
+      results.push("\n**Tickets by Priority:**");
+      for (const priorityEntry of priorityCounts) {
+        results.push(`- ${priorityEntry.priority}: ${priorityEntry._count.id}`);
+      }
+    }
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayCount = await prisma.ticket.count({
+      where: { ...analyticsWhere, createdAt: { gte: todayStart } },
+    });
+    results.push(`\n**Today's tickets**: ${todayCount}`);
+
+    const weekStart = new Date();
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+    weekStart.setHours(0, 0, 0, 0);
+    const weekCount = await prisma.ticket.count({
+      where: { ...analyticsWhere, createdAt: { gte: weekStart } },
+    });
+    results.push(`**This week's tickets**: ${weekCount}`);
+
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    const monthCount = await prisma.ticket.count({
+      where: { ...analyticsWhere, createdAt: { gte: monthStart } },
+    });
+    results.push(`**This month's tickets**: ${monthCount}`);
+
+    const commonIssuesWhere = departmentScope
+      ? Prisma.sql`WHERE type = ${departmentScope}`
+      : Prisma.empty;
+    const commonIssues = await prisma.$queryRaw<
+      Array<{ title: string; count: bigint }>
+    >(Prisma.sql`
+      SELECT title, COUNT(*) as count
+      FROM Ticket
+      ${commonIssuesWhere}
+      GROUP BY title
+      HAVING COUNT(*) > 1
+      ORDER BY count DESC
+      LIMIT 5
+    `);
+    if (commonIssues.length > 0) {
+      results.push("\n**Most Recurring Issues:**");
+      for (const issue of commonIssues) {
+        results.push(`- "${issue.title}" — ${issue.count} tickets`);
+      }
+    }
+
+    const avgResolutionWhere = departmentScope
+      ? Prisma.sql`WHERE resolvedAt IS NOT NULL AND type = ${departmentScope}`
+      : Prisma.sql`WHERE resolvedAt IS NOT NULL`;
+    const avgResolution = await prisma.$queryRaw<
+      Array<{ avg_hours: number | null }>
+    >(Prisma.sql`
+      SELECT AVG(TIMESTAMPDIFF(HOUR, createdAt, resolvedAt)) as avg_hours
+      FROM Ticket
+      ${avgResolutionWhere}
+    `);
+    if (avgResolution[0]?.avg_hours) {
+      const averageHours = Math.round(avgResolution[0].avg_hours);
+      results.push(
+        `\n**Average Resolution Time**: ${averageHours >= 24 ? `${Math.round(averageHours / 24)} days` : `${averageHours} hours`}`,
+      );
+    }
+
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const overdueTickets = await prisma.ticket.findMany({
+      where: {
+        ...analyticsWhere,
+        status: { notIn: ["RESOLVED", "CLOSED", "CANCELLED"] },
+        createdAt: { lt: sevenDaysAgo },
+      },
+      select: {
+        ticketNumber: true,
+        title: true,
+        status: true,
+        priority: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: "asc" },
+      take: 5,
+    });
+    if (overdueTickets.length > 0) {
+      results.push("\n**Overdue Tickets (>7 days unresolved):**");
+      for (const ticket of overdueTickets) {
+        const daysOld = Math.round(
+          (Date.now() - new Date(ticket.createdAt).getTime()) / 86400000,
+        );
+        results.push(
+          `- ${ticket.ticketNumber}: ${ticket.title} — ${ticket.status} — ${ticket.priority} — ${daysOld} days old`,
+        );
+      }
+    }
+
+    const workload = await this.getActiveWorkloadRows(10, departmentScope);
+    if (workload.length > 0) {
+      results.push("\n**Current Staff Workload (active tickets):**");
+      for (const workloadRow of workload) {
+        results.push(
+          `- ${workloadRow.displayName} (${workloadRow.role}): ${workloadRow.activeCount} active ticket(s)`,
+        );
+      }
+    }
+
+    const completedSlaTickets = await prisma.ticket.findMany({
+      where: {
+        ...analyticsWhere,
+        dueDate: { not: null },
+        status: { in: ["RESOLVED", "CLOSED"] },
+        OR: [{ resolvedAt: { not: null } }, { closedAt: { not: null } }],
+      },
+      select: {
+        dueDate: true,
+        resolvedAt: true,
+        closedAt: true,
+      },
+    });
+
+    const slaTotal = completedSlaTickets.length;
+    const slaMet = completedSlaTickets.filter((ticket) => {
+      const completedAt = ticket.resolvedAt || ticket.closedAt;
+      return (
+        completedAt != null &&
+        ticket.dueDate != null &&
+        completedAt <= ticket.dueDate
+      );
+    }).length;
+
+    if (slaTotal > 0) {
+      const complianceRate = Math.round((slaMet / slaTotal) * 100);
+      results.push(
+        `\n**SLA Compliance**: ${slaMet}/${slaTotal} completed ticket(s) met SLA (${complianceRate}%)`,
+      );
+    }
+
+    if (
+      role === "ADMIN" &&
+      /\b(user|users|staff|account)\b/i.test(normalizedMessage)
+    ) {
+      const userAggregateContext = await this.buildUserAggregateContext();
+      if (userAggregateContext) {
+        results.push(`\n${userAggregateContext}`);
+      }
+    }
+
+    return results.length > 0 ? results.join("\n") : null;
+  }
+
+  private async buildUserQueryContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    const normalizedMessage = message.toLowerCase();
+    const wantsAggregate =
+      /how many\s+user/i.test(normalizedMessage) ||
+      /user.*(count|total|registered|breakdown|distribution|statistic)/i.test(
+        normalizedMessage,
+      ) ||
+      /registered\s+user/i.test(normalizedMessage) ||
+      /(user|staff|account)\s*(breakdown|by role|per role|distribution)/i.test(
+        normalizedMessage,
+      ) ||
+      /role.*(user|count|breakdown|distribution)/i.test(normalizedMessage);
+
+    const wantsRegularUsers =
+      /\b(show|list|display|who are)\b.*\b(regular users?|users? with role user)\b/i.test(
+        message,
+      );
+    const wantsAdmins =
+      /\b(show|list|display|who are)\b.*\b(admins?|administrators?)\b/i.test(
+        message,
+      );
+    const wantsDeactivatedUsers =
+      /\b(show|list|display|who are)\b.*\b(deactivated|inactive|disabled)\s+(users?|accounts?)\b/i.test(
+        message,
+      );
+    const wantsRecentUsers =
+      /\b(show|list|display)\b.*\b(new|newest|recent)\s+users?\b/i.test(
+        message,
+      );
+    const wantsStaffDirectory =
+      /\b(show|list|display|who are)\b.*\b(staff|employees?)\b/i.test(message);
+
+    const wantsDirectoryList =
+      wantsRegularUsers ||
+      wantsAdmins ||
+      wantsDeactivatedUsers ||
+      wantsRecentUsers ||
+      wantsStaffDirectory;
+
+    if (!wantsAggregate && !wantsDirectoryList) {
+      return null;
+    }
+
+    if (!wantsDirectoryList) {
+      return this.buildUserAggregateContext();
+    }
+
+    if (role !== "ADMIN") {
+      const aggregateContext = await this.buildUserAggregateContext();
+      return [
+        "**User Directory Access**",
+        "Person-level user lists in chat are ADMIN only. I can still provide aggregate user counts and role breakdowns.",
+        aggregateContext,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+
+    const requestedLimit = this.extractRequestedLimit(message, 3, 5);
+    const userWhere: any = {};
+    let title = "**User Directory:**";
+
+    if (wantsRegularUsers) {
+      userWhere.role = "USER";
+      title = `**Regular Users (top ${requestedLimit}):**`;
+    } else if (wantsAdmins) {
+      userWhere.role = "ADMIN";
+      title = `**Admin Accounts (top ${requestedLimit}):**`;
+    } else if (wantsDeactivatedUsers) {
+      userWhere.isActive = false;
+      title = `**Deactivated User Accounts (top ${requestedLimit}):**`;
+    } else if (wantsStaffDirectory) {
+      userWhere.role = { in: STAFF_ROLES.filter((entry) => entry !== "ADMIN") };
+      title = `**Staff Accounts (top ${requestedLimit}):**`;
+    } else if (wantsRecentUsers) {
+      title = `**Newest User Accounts (top ${requestedLimit}):**`;
+    }
+
+    const users = await prisma.user.findMany({
+      where: userWhere,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        isActive: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: "desc" },
+      take: requestedLimit,
+    });
+
+    if (users.length === 0) {
+      return `${title}\nNo matching users were found.`;
+    }
+
+    const lines = [title];
+    for (const user of users) {
+      lines.push(
+        `- ${user.name || user.email} — ${user.email} — ${user.role} — ${user.isActive ? "Active" : "Inactive"} — Joined ${this.formatDateOnly(user.createdAt)}`,
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  private async buildUserAggregateContext(): Promise<string | null> {
+    const usersByRole = await prisma.user.groupBy({
+      by: ["role"],
+      _count: { id: true },
+    });
+    const activeCount = await prisma.user.count({ where: { isActive: true } });
+    const inactiveCount = await prisma.user.count({
+      where: { isActive: false },
+    });
+    const totalUsers = activeCount + inactiveCount;
+    if (totalUsers === 0) {
+      return null;
+    }
+
+    const lines = ["**User Statistics:**"];
+    lines.push(`Total registered users: ${totalUsers}`);
+    lines.push(`- Active: ${activeCount}`);
+    lines.push(`- Deactivated: ${inactiveCount}`);
+    lines.push("**Users by Role:**");
+    for (const roleEntry of usersByRole) {
+      lines.push(`- ${roleEntry.role}: ${roleEntry._count.id}`);
+    }
+    return lines.join("\n");
+  }
+
+  private async buildApprovalWorkflowContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    const secretaryQueueQuery =
+      /\b(secretary review|for review)\b/i.test(message) ||
+      /\b(secretary)\b.*\b(pending|queue|review|awaiting)\b/i.test(message);
+    const directorQueueQuery =
+      /\b(pending director approval|director approval)\b/i.test(message) ||
+      /\b(director)\b.*\b(pending|approval|queue|awaiting)\b/i.test(message);
+
+    if (!secretaryQueueQuery && !directorQueueQuery) {
+      return null;
+    }
+
+    if (
+      secretaryQueueQuery &&
+      !SECRETARY_REVIEW_ACCESS_ROLES.includes(role as any)
+    ) {
+      return "**Secretary Review Queue**\nThis queue is visible only to ADMIN, SECRETARY, MIS_HEAD, and ITS_HEAD users.";
+    }
+
+    if (
+      directorQueueQuery &&
+      !DIRECTOR_REVIEW_ACCESS_ROLES.includes(role as any)
+    ) {
+      return "**Director Approval Queue**\nThis queue is visible only to ADMIN, DIRECTOR, MIS_HEAD, and ITS_HEAD users.";
+    }
+
+    const requestedLimit = this.extractRequestedLimit(message, 5, 5);
+    const departmentScope = this.getDepartmentScope(role, message);
+    const queryStatus = secretaryQueueQuery ? "FOR_REVIEW" : "REVIEWED";
+
+    const queueWhere: any = {
+      status: queryStatus,
+      ...(departmentScope ? { type: departmentScope } : {}),
+    };
+
+    const [totalCount, queueTickets] = await Promise.all([
+      prisma.ticket.count({ where: queueWhere }),
+      prisma.ticket.findMany({
+        where: queueWhere,
+        select: {
+          ticketNumber: true,
+          title: true,
+          type: true,
+          priority: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: "asc" },
+        take: requestedLimit,
+      }),
+    ]);
+
+    const header = secretaryQueueQuery
+      ? "**Tickets Pending Secretary Review:**"
+      : "**Tickets Pending Director Approval:**";
+    const lines = [header, `Total tickets in queue: ${totalCount}`];
+    if (queueTickets.length === 0) {
+      lines.push("No tickets are currently waiting in this approval queue.");
+      return lines.join("\n");
+    }
+
+    for (const ticket of queueTickets) {
+      lines.push(
+        `- ${ticket.ticketNumber}: ${ticket.title} — ${ticket.type} — ${ticket.priority} — Submitted ${this.formatDateOnly(ticket.createdAt)}`,
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  private async buildEscalationContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    const wantsEscalations = /\b(escalated?|escalation)\b/i.test(message);
+    const wantsOldestTickets =
+      /\b(oldest|stuck|aging|ageing)\b.*\b(ticket|request)\b/i.test(message);
+    const wantsStatusHistory =
+      /\b(status history|status changes|recent transitions?)\b/i.test(message);
+
+    if (!wantsEscalations && !wantsOldestTickets && !wantsStatusHistory) {
+      return null;
+    }
+
+    const requestedLimit = this.extractRequestedLimit(message, 5, 5);
+    const departmentScope = this.getDepartmentScope(role, message);
+
+    if (wantsStatusHistory) {
+      const historyEntries = await prisma.ticketStatusHistory.findMany({
+        where: {
+          ...(departmentScope ? { ticket: { type: departmentScope } } : {}),
+        },
+        select: {
+          createdAt: true,
+          fromStatus: true,
+          toStatus: true,
+          ticket: { select: { ticketNumber: true, title: true } },
+          user: { select: { name: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        take: requestedLimit,
+      });
+
+      if (historyEntries.length === 0) {
+        return "**Recent Status Transitions:**\nNo recent status history entries were found.";
+      }
+
+      const lines = ["**Recent Status Transitions:**"];
+      for (const historyEntry of historyEntries) {
+        lines.push(
+          `- ${historyEntry.ticket.ticketNumber}: ${historyEntry.fromStatus || "NEW"} → ${historyEntry.toStatus} on ${this.formatDateOnly(historyEntry.createdAt)} by ${historyEntry.user.name || "Staff"}`,
+        );
+      }
+      return lines.join("\n");
+    }
+
+    if (wantsEscalations) {
+      const escalationWhere: any = {
+        escalationLevel: { gt: 0 },
+        ...(departmentScope ? { type: departmentScope } : {}),
+      };
+      const [escalationCounts, escalatedTickets] = await Promise.all([
+        prisma.ticket.groupBy({
+          by: ["escalationLevel"],
+          where: escalationWhere,
+          _count: { id: true },
+          orderBy: { escalationLevel: "desc" },
+        }),
+        prisma.ticket.findMany({
+          where: escalationWhere,
+          select: {
+            ticketNumber: true,
+            title: true,
+            type: true,
+            priority: true,
+            escalationLevel: true,
+            escalatedAt: true,
+          },
+          orderBy: [{ escalationLevel: "desc" }, { escalatedAt: "desc" }],
+          take: requestedLimit,
+        }),
+      ]);
+
+      const lines = ["**Escalated Tickets:**"];
+      if (escalatedTickets.length === 0) {
+        lines.push("No escalated tickets were found.");
+        return lines.join("\n");
+      }
+
+      for (const escalationCount of escalationCounts) {
+        lines.push(
+          `- Level ${escalationCount.escalationLevel}: ${escalationCount._count.id} ticket(s)`,
+        );
+      }
+      for (const ticket of escalatedTickets) {
+        lines.push(
+          `- ${ticket.ticketNumber}: ${ticket.title} — ${ticket.type} — ${ticket.priority} — Level ${ticket.escalationLevel}${ticket.escalatedAt ? ` — Escalated ${this.formatDateOnly(ticket.escalatedAt)}` : ""}`,
+        );
+      }
+
+      return lines.join("\n");
+    }
+
+    const oldestActiveTickets = await prisma.ticket.findMany({
+      where: {
+        status: { in: [...ACTIVE_TICKET_STATUSES] },
+        ...(departmentScope ? { type: departmentScope } : {}),
+      },
+      select: {
+        ticketNumber: true,
+        title: true,
+        status: true,
+        priority: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: "asc" },
+      take: requestedLimit,
+    });
+
+    if (oldestActiveTickets.length === 0) {
+      return "**Oldest Active Tickets:**\nNo active tickets were found.";
+    }
+
+    const lines = ["**Oldest Active Tickets:**"];
+    for (const ticket of oldestActiveTickets) {
+      const ageInDays = Math.round(
+        (Date.now() - new Date(ticket.createdAt).getTime()) / 86400000,
+      );
+      lines.push(
+        `- ${ticket.ticketNumber}: ${ticket.title} — ${ticket.status} — ${ticket.priority} — ${ageInDays} day(s) old`,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  private async buildWorkloadContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    const normalizedMessage = message.toLowerCase();
+    const wantsWorkload =
+      /\b(workload|productivity|assigned tickets|active tickets per staff)\b/i.test(
+        message,
+      ) ||
+      /\b(who has|who is)\b.*\b(most|highest|busiest)\b.*\b(ticket|workload)\b/i.test(
+        message,
+      );
+
+    if (!wantsWorkload) {
+      return null;
+    }
+
+    const requestedLimit = this.extractRequestedLimit(message, 5, 10);
+    const departmentScope = this.getDepartmentScope(role, message);
+    const workloadRows = await this.getActiveWorkloadRows(
+      requestedLimit,
+      departmentScope,
+    );
+
+    if (workloadRows.length === 0) {
+      return "**Current Staff Workload:**\nNo active assignments were found.";
+    }
+
+    const lines = ["**Current Staff Workload:**"];
+    for (const workloadRow of workloadRows) {
+      lines.push(
+        `- ${workloadRow.displayName} (${workloadRow.role}): ${workloadRow.activeCount} active ticket(s)`,
+      );
+    }
+
+    if (
+      normalizedMessage.includes("most") ||
+      normalizedMessage.includes("busiest")
+    ) {
+      const busiest = workloadRows[0];
+      lines.push(
+        `\nBusiest staff member right now: ${busiest.displayName} with ${busiest.activeCount} active ticket(s).`,
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  private async buildCategoryBreakdownContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    const categoryKeywords =
+      /\b(website|software|borrow|printer|network|internet|hardware|maintenance)\b/i;
+    const analyticsKeywords =
+      /\b(show|list|count|how many|breakdown|summary|analytics|statistics|stats|report|reports|dashboard|overview|distribution|compare)\b/i;
+    const categoryIntent =
+      /\b(mis|its)\b.*\b(category|breakdown|request|requests|tickets)\b/i.test(
+        message,
+      ) ||
+      (analyticsKeywords.test(message) && categoryKeywords.test(message));
+
+    if (!categoryIntent) {
+      return null;
+    }
+
+    const departmentScope = this.getDepartmentScope(role, message);
+    const lines = ["**Department / Category Breakdown:**"];
+
+    if (!departmentScope || departmentScope === "MIS") {
+      const [
+        misCount,
+        websiteNewRequest,
+        websiteUpdate,
+        softwareNewRequest,
+        softwareUpdate,
+        softwareInstall,
+      ] = await Promise.all([
+        prisma.ticket.count({ where: { type: "MIS" } }),
+        prisma.mISTicket.count({ where: { websiteNewRequest: true } }),
+        prisma.mISTicket.count({ where: { websiteUpdate: true } }),
+        prisma.mISTicket.count({ where: { softwareNewRequest: true } }),
+        prisma.mISTicket.count({ where: { softwareUpdate: true } }),
+        prisma.mISTicket.count({ where: { softwareInstall: true } }),
+      ]);
+
+      lines.push(`MIS tickets: ${misCount}`);
+      lines.push(`- Website new requests: ${websiteNewRequest}`);
+      lines.push(`- Website updates: ${websiteUpdate}`);
+      lines.push(`- Software new requests: ${softwareNewRequest}`);
+      lines.push(`- Software updates: ${softwareUpdate}`);
+      lines.push(`- Software installations: ${softwareInstall}`);
+    }
+
+    if (!departmentScope || departmentScope === "ITS") {
+      const [
+        itsCount,
+        borrowRequest,
+        desktopLaptop,
+        internetNetwork,
+        printerMaintenance,
+      ] = await Promise.all([
+        prisma.ticket.count({ where: { type: "ITS" } }),
+        prisma.iTSTicket.count({ where: { borrowRequest: true } }),
+        prisma.iTSTicket.count({ where: { maintenanceDesktopLaptop: true } }),
+        prisma.iTSTicket.count({ where: { maintenanceInternetNetwork: true } }),
+        prisma.iTSTicket.count({ where: { maintenancePrinter: true } }),
+      ]);
+
+      lines.push(`ITS tickets: ${itsCount}`);
+      lines.push(`- Borrow requests: ${borrowRequest}`);
+      lines.push(`- Desktop/Laptop maintenance: ${desktopLaptop}`);
+      lines.push(`- Internet/Network maintenance: ${internetNetwork}`);
+      lines.push(`- Printer maintenance: ${printerMaintenance}`);
+    }
+
+    return lines.join("\n");
+  }
+
+  private async buildKnowledgeCoverageContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    const knowledgeBaseIntent =
+      /\b(knowledge base|kb|faq|faqs|article|articles)\b/i.test(message) &&
+      /\b(count|counts|summary|stat|analytic|breakdown|most viewed|most helpful|coverage|updated|how many|show|list)\b/i.test(
+        message,
+      );
+    const solutionIntent =
+      /\b(troubleshooting solution|troubleshooting solutions|solution library|solution database|solutions?)\b/i.test(
+        message,
+      ) &&
+      /\b(count|counts|summary|stat|analytic|breakdown|visibility|category|updated|how many|show|list)\b/i.test(
+        message,
+      );
+
+    if (!knowledgeBaseIntent && !solutionIntent) {
+      return null;
+    }
+
+    const lines: string[] = [];
+
+    if (knowledgeBaseIntent) {
+      const [articlesByStatus, articlesByCategory, topArticles] =
+        await Promise.all([
+          prisma.knowledgeArticle.groupBy({
+            by: ["status"],
+            _count: { id: true },
+          }),
+          prisma.knowledgeArticle.groupBy({
+            by: ["category"],
+            _count: { id: true },
+            orderBy: { _count: { id: "desc" } },
+          }),
+          prisma.knowledgeArticle.findMany({
+            where: { status: "PUBLISHED" },
+            select: {
+              title: true,
+              category: true,
+              viewCount: true,
+              helpfulCount: true,
+            },
+            orderBy: [{ viewCount: "desc" }, { helpfulCount: "desc" }],
+            take: 3,
+          }),
+        ]);
+
+      lines.push("**Knowledge Base Coverage:**");
+      for (const statusEntry of articlesByStatus) {
+        lines.push(`- ${statusEntry.status}: ${statusEntry._count.id}`);
+      }
+      if (articlesByCategory.length > 0) {
+        lines.push("**Articles by Category:**");
+        for (const categoryEntry of articlesByCategory.slice(0, 5)) {
+          lines.push(`- ${categoryEntry.category}: ${categoryEntry._count.id}`);
+        }
+      }
+      if (topArticles.length > 0) {
+        lines.push("**Most Viewed Published Articles:**");
+        for (const article of topArticles) {
+          lines.push(
+            `- ${article.title} (${article.category}) — ${article.viewCount} view(s), ${article.helpfulCount} helpful vote(s)`,
+          );
+        }
+      }
+    }
+
+    if (solutionIntent) {
+      const [solutionsByVisibility, solutionsByCategory, recentSolutions] =
+        await Promise.all([
+          prisma.troubleshootingSolution.groupBy({
+            by: ["visibility"],
+            _count: { id: true },
+          }),
+          prisma.troubleshootingSolution.groupBy({
+            by: ["category"],
+            _count: { id: true },
+            orderBy: { _count: { id: "desc" } },
+          }),
+          prisma.troubleshootingSolution.findMany({
+            select: {
+              problem: true,
+              category: true,
+              visibility: true,
+              updatedAt: true,
+            },
+            orderBy: { updatedAt: "desc" },
+            take: 3,
+          }),
+        ]);
+
+      if (lines.length > 0) {
+        lines.push("");
+      }
+      lines.push("**Troubleshooting Solutions Coverage:**");
+      for (const visibilityEntry of solutionsByVisibility) {
+        lines.push(
+          `- ${visibilityEntry.visibility}: ${visibilityEntry._count.id}`,
+        );
+      }
+      if (solutionsByCategory.length > 0) {
+        lines.push("**Solutions by Category:**");
+        for (const categoryEntry of solutionsByCategory.slice(0, 5)) {
+          lines.push(`- ${categoryEntry.category}: ${categoryEntry._count.id}`);
+        }
+      }
+      if (recentSolutions.length > 0) {
+        lines.push("**Recently Updated Solutions:**");
+        for (const solution of recentSolutions) {
+          lines.push(
+            `- ${solution.problem.substring(0, 80)}${solution.problem.length > 80 ? "..." : ""} — ${solution.category} — ${solution.visibility} — Updated ${this.formatDateOnly(solution.updatedAt)}`,
+          );
+        }
+      }
+    }
+
+    return lines.length > 0 ? lines.join("\n") : null;
+  }
+
+  private checkExcludedOperationalQuery(message: string): string | null {
+    const wantsData =
+      /\b(show|list|count|how many|what|which|analytics|report|summary|dashboard)\b/i.test(
+        message,
+      );
+    const excludedTables =
+      /\b(notification|notifications|chat history|chat session|chat sessions|chat message|chat messages|attachment|attachments|ticket counter|ticket counters|migration|migrations|_prisma_migrations)\b/i.test(
+        message,
+      );
+
+    if (wantsData && excludedTables) {
+      return EXCLUDED_OPERATIONAL_DATA_RESPONSE;
+    }
+
+    return null;
+  }
+
+  private checkOperationalCoverageQuery(
+    message: string,
+    role: string,
+  ): string | null {
+    const asksAboutCoverage =
+      /\b(what|which)\b.*\b(data|tables|queries|questions|analytics)\b/i.test(
+        message,
+      ) ||
+      /\bwhat can you answer\b/i.test(message) ||
+      /\bwhat can you access\b/i.test(message);
+
+    if (!asksAboutCoverage) {
+      return null;
+    }
+
+    const lines = [
+      "**Supported Admin/Staff Chat Queries:**",
+      "- Ticket analytics: status, priority, type, backlog, overdue, due soon, SLA, recurring issues, average resolution time",
+      "- Workload analytics: active assignments by staff member and busiest staff members",
+      "- Approval workflows: tickets pending secretary review and tickets pending director approval",
+      "- Escalations and timelines: escalated tickets, oldest active tickets, recent status transitions",
+      "- Department breakdowns: MIS vs ITS counts plus website/software/borrow/network/printer maintenance categories",
+      "- Knowledge coverage: knowledge-base article counts, categories, and most-viewed published articles",
+      "- Troubleshooting solutions: visibility counts, categories, and recently updated solutions",
+      "- User summaries: aggregate user totals and role breakdowns",
+    ];
+
+    if (role === "ADMIN") {
+      lines.push(
+        "- ADMIN-only user directory lists: regular users, deactivated users, staff accounts, admins, and newest users",
+      );
+    } else if (STAFF_ROLES.includes(role as any)) {
+      lines.push(
+        "- Person-level user directory lists stay ADMIN only; staff can still ask for aggregate user counts and role breakdowns",
+      );
+    }
+
+    lines.push(
+      "- Excluded in chat: notifications, chat history, attachments, ticket counters, and migration/internal tables",
+    );
+    return lines.join("\n");
+  }
+
+  private checkHelpCommand(message: string, role: string): string | null {
+    const normalizedMessage = message.trim().toLowerCase();
+    const helpIntent =
+      /^\/help(?:\s|$)/i.test(normalizedMessage) ||
+      /\bwhat can you do\b/i.test(normalizedMessage) ||
+      /\bwhat are my options\b/i.test(normalizedMessage) ||
+      /\bshow (?:me )?help\b/i.test(normalizedMessage) ||
+      /\bhelp(?: me)? understand what you can do\b/i.test(normalizedMessage) ||
+      /\bwhat can i ask you\b/i.test(normalizedMessage) ||
+      /\blist (?:your )?(?:commands|options|capabilities)\b/i.test(
+        normalizedMessage,
+      );
+
+    if (!helpIntent) {
+      return null;
+    }
+
+    return this.buildHelpResponse(role);
+  }
+
+  private buildHelpResponse(role: string): string {
+    const lines = [
+      "## Chat Help",
+      "I stay focused on CHMSU ICT support and the capabilities that already exist in this system.",
+      "",
+      "### Core support I can provide",
+      "- **Troubleshoot common ICT issues**",
+      "  Example: `My internet is not working`",
+      "- **Search the knowledge base for existing solutions**",
+      "  Example: `Do we have a guide for printer troubleshooting?`",
+      "- **Check ticket status**",
+      "  Example: `What is the status of my tickets?`",
+      "- **Help prepare a support ticket**",
+      "  Example: `I want to create a support ticket`",
+    ];
+
+    if (role === "MIS_HEAD") {
+      lines.push(
+        "",
+        "### MIS head capabilities",
+        "- **MIS-only analytics and reports**",
+        "  Example: `Show me MIS analytics`",
+        "- **MIS workload, overdue tickets, and SLA warnings**",
+        "  Example: `Show me overdue MIS tickets`",
+        "- **MIS approval and escalation monitoring**",
+        "  Example: `Show me MIS escalations`",
+      );
+    } else if (role === "ITS_HEAD") {
+      lines.push(
+        "",
+        "### ITS head capabilities",
+        "- **ITS-only analytics and reports**",
+        "  Example: `Show me ITS analytics`",
+        "- **ITS workload, overdue tickets, and SLA warnings**",
+        "  Example: `Show me overdue ITS tickets`",
+        "- **ITS approval and escalation monitoring**",
+        "  Example: `Show me ITS escalations`",
+      );
+    } else if (role === "SECRETARY") {
+      lines.push(
+        "",
+        "### Secretary capabilities",
+        "- **Operational analytics and reports**",
+        "  Example: `Generate a full Excel report of all tickets`",
+        "- **Secretary approval queue monitoring**",
+        "  Example: `Show me tickets pending secretary review`",
+        "- **SLA warnings and overdue ticket monitoring**",
+        "  Example: `Show me overdue tickets and SLA warnings`",
+      );
+    } else if (role === "DIRECTOR") {
+      lines.push(
+        "",
+        "### Director capabilities",
+        "- **Operational analytics and reports**",
+        "  Example: `Show me the ICT statistics and analytics`",
+        "- **Director approval queue monitoring**",
+        "  Example: `Show me tickets pending director approval`",
+        "- **SLA warnings and escalations**",
+        "  Example: `Show me escalated tickets`",
+      );
+    } else if (role === "ADMIN") {
+      lines.push(
+        "",
+        "### Admin capabilities",
+        "- **Cross-department analytics and reports**",
+        "  Example: `Show me the ICT statistics and analytics`",
+        "- **User summaries and role breakdowns**",
+        "  Example: `Show me the user role breakdown`",
+        "- **Workload, approvals, escalations, and SLA monitoring**",
+        "  Example: `Show me the busiest staff members`",
+      );
+    } else if (STAFF_ROLES.includes(role as any)) {
+      lines.push(
+        "",
+        "### Staff capabilities",
+        "- **Operational analytics and reports**",
+        "  Example: `Generate a full Excel report of all tickets`",
+        "- **Workload and SLA monitoring**",
+        "  Example: `Show me overdue tickets and SLA warnings`",
+        "- **Escalation and ticket trend queries**",
+        "  Example: `Show me escalated tickets`",
+      );
+    }
+
+    if (role === "USER") {
+      lines.push(
+        "",
+        "### Limits for regular users",
+        "- I only cover ICT support topics inside this system.",
+        "- I do not provide analytics, statistics, or report downloads to regular users.",
+        "- I do not answer general questions like weather, recipes, entertainment, politics, or homework.",
+      );
+    } else {
+      lines.push(
+        "",
+        "### Staff limits",
+        "- Chat is read-only. It cannot approve, delete, deactivate, restore, or reassign records for you.",
+        "- ADMIN-only user directory lists stay restricted to ADMIN.",
+        "- I still stay inside ICT support topics and system-backed data.",
+      );
+    }
+
+    lines.push(
+      "",
+      "Type `/help` anytime to see this again.",
+      "You can also use one of the quick options below.",
+    );
+
+    return `${lines.join("\n")}\n\n${QUICK_OPTIONS_BLOCK}`;
+  }
+
+  private checkOutOfScopeQuery(message: string, role: string): string | null {
+    const normalizedMessage = message.trim().toLowerCase();
+    if (!normalizedMessage || ICT_SCOPE_KEYWORDS.test(normalizedMessage)) {
+      return null;
+    }
+
+    const outOfScope = OUT_OF_SCOPE_PATTERNS.some((pattern) =>
+      pattern.test(normalizedMessage),
+    );
+
+    if (!outOfScope) {
+      return null;
+    }
+
+    const roleSummary = STAFF_ROLES.includes(role as any)
+      ? "I can help with ICT troubleshooting, knowledge-base lookups, ticket status, and your allowed analytics or report questions."
+      : "I can help with ICT troubleshooting, knowledge-base lookups, ticket status, and support ticket creation.";
+
+    return [
+      "I'm focused on CHMSU ICT support topics only.",
+      roleSummary,
+      "Please choose one of the quick options below or describe your ICT issue in plain language.",
+      QUICK_OPTIONS_BLOCK,
+    ].join("\n\n");
+  }
+
+  private checkDeletionPolicyQuery(
+    message: string,
+    role: string,
+  ): string | null {
+    const normalizedMessage = message.toLowerCase();
+    const deletionIntent =
+      /\b(delete|deletion|deactivate|deactivation|remove|hard delete|permanent)\b/i.test(
+        normalizedMessage,
+      ) && /\b(user|account|note|article|solution)\b/i.test(normalizedMessage);
+
+    if (!deletionIntent) {
+      return null;
+    }
+
+    const lines = ["**Deletion Safeguards:**"];
+    if (role !== "ADMIN" && /\buser|account\b/i.test(normalizedMessage)) {
+      lines.push(
+        "- User account management is ADMIN only. Chat can explain the policy, but it will not execute account actions.",
+      );
+    }
+    lines.push(
+      "- User accounts cannot be hard-deleted when they still own open tickets or are assigned to active tickets. Deactivation is the safer reversible option.",
+    );
+    lines.push(
+      "- Ticket notes, knowledge-base articles, and troubleshooting solutions are hard-delete actions with audit logging.",
+    );
+    lines.push(
+      "- Chat is read-only for delete, deactivate, restore, and reassign requests. Use the proper admin/staff screens for those actions.",
+    );
+    return lines.join("\n");
+  }
+
+  private getDepartmentScope(
+    role: string,
+    message: string,
+  ): "MIS" | "ITS" | null {
+    const normalizedMessage = message.toLowerCase();
+
+    if (/\bmis\b|website|software/i.test(normalizedMessage)) {
+      return "MIS";
+    }
+
+    if (
+      /\bits\b|hardware|printer|network|internet|borrow|maintenance/i.test(
+        normalizedMessage,
+      )
+    ) {
+      return "ITS";
+    }
+
+    if (role === "MIS_HEAD") {
+      return "MIS";
+    }
+
+    if (role === "ITS_HEAD") {
+      return "ITS";
+    }
+
+    return null;
+  }
+
+  private extractRequestedLimit(
+    message: string,
+    fallback = 5,
+    max = 10,
+  ): number {
+    const limitMatch = message.match(/\b(\d{1,2})\b/);
+    if (!limitMatch) {
+      return fallback;
+    }
+
+    const requestedLimit = Number(limitMatch[1]);
+    if (!Number.isFinite(requestedLimit) || requestedLimit <= 0) {
+      return fallback;
+    }
+
+    return Math.min(requestedLimit, max);
+  }
+
+  private formatDateOnly(value: Date | string): string {
+    return new Date(value).toLocaleDateString();
+  }
+
+  private async getActiveWorkloadRows(
+    limit: number,
+    type?: "MIS" | "ITS" | null,
+  ): Promise<
+    Array<{ displayName: string; role: string; activeCount: number }>
+  > {
+    const assignmentCounts = await prisma.ticketAssignment.groupBy({
+      by: ["userId"],
+      where: {
+        ticket: {
+          status: { in: [...ACTIVE_TICKET_STATUSES] },
+          ...(type ? { type } : {}),
+        },
+      },
+      _count: { id: true },
+      orderBy: { _count: { id: "desc" } },
+      take: limit,
+    });
+
+    if (assignmentCounts.length === 0) {
+      return [];
+    }
+
+    const users = await prisma.user.findMany({
+      where: {
+        id: { in: assignmentCounts.map((assignment) => assignment.userId) },
+      },
+      select: { id: true, name: true, email: true, role: true },
+    });
+
+    const usersById = new Map(users.map((user) => [user.id, user]));
+    return assignmentCounts.map((assignment) => {
+      const user = usersById.get(assignment.userId);
+      return {
+        displayName: user?.name || user?.email || `User #${assignment.userId}`,
+        role: user?.role || "UNKNOWN",
+        activeCount: assignment._count.id,
+      };
+    });
+  }
+
+  // ========================================
+  // REPORT REQUEST DETECTION
+  // ========================================
+
+  private checkReportRequest(message: string, userRole: string): string | null {
+    const msg = message.toLowerCase();
+
+    const reportPatterns = [
+      /\b(generate|create|make|download|export|give me|produce|prepare)\b.*\b(report|excel|spreadsheet|xlsx|csv)\b/i,
+      /\b(report|excel|spreadsheet)\b.*\b(generate|create|download|export)\b/i,
+      /\b(ticket|data)\b.*\b(report|export)\b/i,
+      /\bexcel\b.*\b(report|spreadsheet|export|download|file)\b/i,
+    ];
+
+    const isReportRequest = reportPatterns.some((p) => p.test(msg));
+    if (!isReportRequest) return null;
+
+    const allowedRoles = [
+      "ADMIN",
+      "DEVELOPER",
+      "TECHNICAL",
+      "MIS_HEAD",
+      "ITS_HEAD",
+      "DIRECTOR",
+      "SECRETARY",
+    ];
+    if (!allowedRoles.includes(userRole)) {
+      return "The user is requesting a report but does NOT have the required role. Only Admin and ICT staff roles can generate reports. Politely inform the user that report generation requires admin or staff privileges.";
+    }
+
+    // Detect the type of report requested
+    let reportType = "full-report";
+    if (/status/i.test(msg)) reportType = "ticket-status";
+    else if (/categor|type/i.test(msg)) reportType = "ticket-category";
+    else if (/priorit/i.test(msg)) reportType = "ticket-priority";
+    else if (/month|trend/i.test(msg)) reportType = "ticket-monthly";
+    else if (/summar/i.test(msg)) reportType = "ticket-summary";
+
+    const baseUrl = "/reports/download";
+    const downloadUrl = `${baseUrl}?type=${reportType}`;
+
+    return `The user is requesting an Excel report. They have the ${userRole} role and ARE authorized.
+Provide a download link in this EXACT markdown format:
+[📥 Download ${reportType.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase())} Report](${downloadUrl})
+
+Available report types and their download links:
+- Full Report (all data): [📥 Download Full Report](${baseUrl}?type=full-report)
+- Ticket Summary: [📥 Download Summary](${baseUrl}?type=ticket-summary)
+- By Status: [📥 Download Status Report](${baseUrl}?type=ticket-status)
+- By Category: [📥 Download Category Report](${baseUrl}?type=ticket-category)
+- By Priority: [📥 Download Priority Report](${baseUrl}?type=ticket-priority)
+- Monthly Trend: [📥 Download Monthly Report](${baseUrl}?type=ticket-monthly)
+
+Tell the user which report type you detected based on their request, and offer the other types too. Remind them they can add date filters (from/to) if needed.`;
+  }
+
+  // ========================================
+  // SLA CONTEXT (Staff/Admin only)
+  // ========================================
+
+  private async getSLAContext(
+    message: string,
+    role: string,
+  ): Promise<string | null> {
+    try {
+      const now = new Date();
+      const todayEnd = new Date(now);
+      todayEnd.setHours(23, 59, 59, 999);
+      const departmentScope = this.getDepartmentScope(role, message);
+      const slaWhere = departmentScope ? { type: departmentScope } : {};
+
+      const [overdueCount, dueTodayCount, dueSoonCount] = await Promise.all([
+        // Overdue: dueDate < now AND not resolved/closed
+        prisma.ticket.count({
+          where: {
+            ...slaWhere,
+            dueDate: { lt: now },
+            status: { notIn: ["RESOLVED", "CLOSED", "CANCELLED"] },
+          },
+        }),
+        // Due today
+        prisma.ticket.count({
+          where: {
+            ...slaWhere,
+            dueDate: { gte: now, lte: todayEnd },
+            status: { notIn: ["RESOLVED", "CLOSED", "CANCELLED"] },
+          },
+        }),
+        // Due within 3 days
+        prisma.ticket.count({
+          where: {
+            ...slaWhere,
+            dueDate: {
+              gte: now,
+              lte: new Date(now.getTime() + 3 * 86400000),
+            },
+            status: { notIn: ["RESOLVED", "CLOSED", "CANCELLED"] },
+          },
+        }),
+      ]);
+
+      if (overdueCount === 0 && dueTodayCount === 0 && dueSoonCount === 0) {
+        return null;
+      }
+
+      const parts: string[] = [];
+      if (departmentScope) {
+        parts.push(`Scope: ${departmentScope} tickets only`);
+      }
+      if (overdueCount > 0)
+        parts.push(`⚠️ ${overdueCount} ticket(s) are OVERDUE`);
+      if (dueTodayCount > 0)
+        parts.push(`🔴 ${dueTodayCount} ticket(s) are due TODAY`);
+      if (dueSoonCount > 0)
+        parts.push(`🟡 ${dueSoonCount} ticket(s) are due within 3 days`);
+
+      return parts.join("\n");
+    } catch (err: any) {
+      logger.error("[ChatService] SLA context failed:", err.message);
+      return null;
+    }
+  }
+
+  // ========================================
+  // LLM CALL WITH FALLBACK
+  // ========================================
+
+  private async callGemini(
+    history: Array<{ role: string; content: string }>,
+    currentMessage: string,
+    contextData: string,
+  ): Promise<{ reply: string; provider: string }> {
+    if (!this.isAvailable()) {
+      return {
+        reply: this.fallbackResponse(currentMessage, contextData),
+        provider: "Offline",
+      };
+    }
+
+    try {
+      const messages: LlmMessage[] = [
+        { role: "system", content: CHAT_SYSTEM_PROMPT },
+        {
+          role: "assistant",
+          content:
+            "Understood. I'm ready to help users with ICT support issues. I'll use the provided context data to give accurate answers and guide ticket creation when needed.",
+        },
+      ];
+
+      const recentHistory = history.slice(-10);
+      for (const msg of recentHistory) {
+        messages.push({
+          role: msg.role === "USER" ? "user" : "assistant",
+          content: msg.content,
+        });
+      }
+
+      let prompt = currentMessage;
+      if (contextData.trim()) {
+        prompt = `CONTEXT DATA (from our internal knowledge base and resolved tickets):\n${contextData}\n\nUSER QUESTION: ${currentMessage}`;
+      }
+
+      messages.push({ role: "user", content: prompt });
+
+      const result = await llmClient.chatCompletion(messages, {
+        temperature: 0.4,
+        maxTokens: 4096,
+        topP: 0.9,
+      });
+
+      return { reply: result.text, provider: result.provider };
+    } catch (err: any) {
+      logger.error(
+        `[ChatService] LLM call failed (${err.message}). Using local curated fallback.`,
+      );
+      return {
+        reply: this.fallbackResponse(currentMessage, contextData),
+        provider: "Offline",
+      };
+    }
+  }
+
+  /**
+   * Fallback when AI is unavailable — parse context data cleanly and return human-feeling response.
+   * If the user is expressing an intent to bypass troubleshooting or create/open a ticket,
+   * we inject a valid ```ticket-data block so the frontend still offers them a click-to-create button.
+   */
+  private fallbackResponse(message: string, contextData: string): string {
+    const isTicketIntent =
+      /\b(create|open|submit|raise|make|just|want\s+to\s+create|get\s+a|need)\s*(a|new)?\s*(support\s*)?ticket\b/i.test(
+        message,
+      ) ||
+      /\b(create\s+ticket|just\s+create|help\s+me\s+create)\b/i.test(message);
+
+    // --- Issue-specific fallback templates ---
+    const issueTemplates: Array<{ pattern: RegExp; response: string }> = [
+      {
+        pattern: /\b(password|forgot.*(login|pass)|account.*(lock|reset)|can't.*(log|sign))/i,
+        response: `I can help you with a password or account issue! Here are a few things you can try first:
+
+1. **Self-service password reset** — Visit the ICT portal at [Password Reset](kb:password-reset) and follow the steps.
+2. **Verify your identity** — Make sure your registered mobile number or email is accessible for the OTP.
+3. **MFA / Authenticator app** — If you're locked out of your authenticator app, contact the ICT help desk to have it reset.
+
+If you've already tried these steps and still can't access your account, I can raise a ticket for the ICT team:
+
+\`\`\`ticket-data
+{
+  "title": "Support Request: Password Reset / Account Help",
+  "description": "User requested account/password assistance via chat: '${message.replace(/"/g, '\\"')}'",
+  "type": "MIS",
+  "priority": "HIGH",
+  "category": "ACCOUNT",
+  "staffNote": "⚠️ Created via offline fallback — user may need MFA reset or account unlock."
+}
+\`\`\`
+
+Would you like to submit this ticket, or try the self-service options first?`,
+      },
+      {
+        pattern: /\b(printer|paper.?jam|can't print|not printing|print.?queue|toner|ink)/i,
+        response: `Let's troubleshoot your printer issue. Try these steps:
+
+1. **Check power and connections** — Make sure the printer is turned on and the USB/network cable is securely connected.
+2. **Check paper and ink/toner** — Open the printer and look for paper jams, low ink, or empty trays.
+3. **Clear the print queue** — Go to *Settings > Devices > Printers & Scanners*, select your printer, and click *Open print queue*. Cancel any stuck documents and try printing again.
+4. **Restart the printer** — Turn it off, wait 30 seconds, and turn it back on.
+
+If none of these steps resolve the problem, I can create a support ticket for a technician:
+
+\`\`\`ticket-data
+{
+  "title": "Support Request: Printer / Hardware Issue",
+  "description": "User reported printer issue via chat: '${message.replace(/"/g, '\\"')}'",
+  "type": "ITS",
+  "priority": "MEDIUM",
+  "category": "HARDWARE",
+  "staffNote": "⚠️ Created via offline fallback — basic troubleshooting steps were provided."
+}
+\`\`\`
+
+Would you like to submit the ticket, or try the steps above?`,
+      },
+      {
+        pattern: /\b(wi.?fi|wifi|internet|connect.*network|no.*connection|network.*down|can't browse)/i,
+        response: `Here are some steps to get you back online:
+
+1. **Toggle Wi-Fi** — Turn Wi-Fi off and on again on your device.
+2. **Restart your router** — Unplug the power, wait 30 seconds, and plug it back in. Wait 2 minutes for it to reboot.
+3. **Try a wired connection** — If possible, connect your device directly to the network with an Ethernet cable.
+4. **Check other devices** — If other devices work but yours doesn't, the issue is likely device-specific.
+
+If the problem persists, I can log a ticket for the network team:
+
+\`\`\`ticket-data
+{
+  "title": "Support Request: Wi-Fi / Network Issue",
+  "description": "User reported network connectivity issue via chat: '${message.replace(/"/g, '\\"')}'",
+  "type": "ITS",
+  "priority": "HIGH",
+  "category": "NETWORK",
+  "staffNote": "⚠️ Created via offline fallback — basic network troubleshooting was provided."
+}
+\`\`\`
+
+Need me to submit the ticket, or would you like to try the steps above first?`,
+      },
+      {
+        pattern: /\b(projector|av.?equip|presentation.*room|borrow.*projector|audio.?visual|screen.*conf(erence)?)/i,
+        response: `Here's how to arrange AV equipment for your presentation:
+
+1. **Check availability** — AV equipment (projectors, screens, speakers) can be booked through the ICT office.
+2. **What you need** — Let me know which room you're presenting in and what equipment you need (projector, laptop adapters, speakers, microphone).
+3. **Booking lead time** — Please request at least 24 hours in advance to ensure availability.
+4. **Pickup location** — Equipment is collected from the ICT Help Desk (Building A, Ground Floor).
+
+I can set up a ticket to book the equipment for you:
+
+\`\`\`ticket-data
+{
+  "title": "Support Request: AV Equipment Booking",
+  "description": "User requested AV equipment via chat: '${message.replace(/"/g, '\\"')}'",
+  "type": "ITS",
+  "priority": "MEDIUM",
+  "category": "GENERAL",
+  "staffNote": "⚠️ Created via offline fallback — please confirm room, date, and equipment needed."
+}
+\`\`\`
+
+Would you like me to submit this booking request?`,
+      },
+      {
+        pattern: /\b(install.*(software|program|app)|need.*(program|tool|app)|email.*(setup|config)|outlook|applicat(ion| software))/i,
+        response: `To request new software or set up an application:
+
+1. **Approval required** — Software installations require your supervisor's approval for licensing and compliance.
+2. **Request process** — Submit a ticket with the software name, version (if known), and why you need it.
+3. **Self-service options** — Check the ICT Software Center on your computer for pre-approved applications you can install directly.
+4. **Email setup** — For Outlook or email configuration, you'll need your full email address and server settings (provided after ticket approval).
+
+I can start the request process for you:
+
+\`\`\`ticket-data
+{
+  "title": "Support Request: Software / Application Request",
+  "description": "User requested software or application setup via chat: '${message.replace(/"/g, '\\"')}'",
+  "type": "ITS",
+  "priority": "MEDIUM",
+  "category": "SOFTWARE",
+  "staffNote": "⚠️ Created via offline fallback — supervisor approval may be required before installation."
+}
+\`\`\`
+
+Shall I submit this request?`,
+      },
+      {
+        pattern: /\b(computer.*(slow|freeze|crash)|laptop.*(turn|start|battery)|blue.?screen|device.*(issue|problem)|pc.*not)/i,
+        response: `Let's troubleshoot your computer issue:
+
+1. **Restart your computer** — A simple restart often resolves temporary glitches. Save your work and reboot.
+2. **Check for updates** — Go to *Settings > Update & Security > Windows Update* and install any pending updates.
+3. **Run in Safe Mode** — If the computer crashes on startup, try booting in Safe Mode (press F8 during boot) to diagnose the issue.
+4. **Check disk space** — Low disk space can cause slow performance. Free up space by deleting temporary files.
+
+If these steps don't help, I can create a ticket for our hardware team:
+
+\`\`\`ticket-data
+{
+  "title": "Support Request: Computer / Device Issue",
+  "description": "User reported computer issue via chat: '${message.replace(/"/g, '\\"')}'",
+  "type": "ITS",
+  "priority": "MEDIUM",
+  "category": "HARDWARE",
+  "staffNote": "⚠️ Created via offline fallback — basic troubleshooting steps were provided."
+}
+\`\`\`
+
+Would you like to submit a ticket for further assistance?`,
+      },
+    ];
+
+    for (const tmpl of issueTemplates) {
+      if (tmpl.pattern.test(message)) {
+        return tmpl.response;
+      }
+    }
+
+    if (isTicketIntent) {
+      // Intelligently guess details from context/message
+      const msgLower = message.toLowerCase();
+      const ctxLower = contextData.toLowerCase();
+      const hasPassword =
+        msgLower.includes("password") || ctxLower.includes("password");
+      const hasWiFi =
+        msgLower.includes("wi-fi") ||
+        msgLower.includes("wifi") ||
+        ctxLower.includes("wi-fi");
+      const hasHardware =
+        msgLower.includes("hardware") ||
+        msgLower.includes("printer") ||
+        msgLower.includes("cable") ||
+        msgLower.includes("device") ||
+        msgLower.includes("hardware");
+
+      let category = "GENERAL";
+      let title = "Support Request";
+      let type = "ITS";
+
+      if (hasPassword) {
+        category = "ACCOUNT";
+        title = "Support Request: Password Reset / Account Help";
+        type = "MIS";
+      } else if (hasWiFi) {
+        category = "NETWORK";
+        title = "Support Request: Wi-Fi / Connectivity Issue";
+        type = "ITS";
+      } else if (hasHardware) {
+        category = "HARDWARE";
+        title = "Support Request: Hardware / Office Device Repair";
+        type = "ITS";
+      }
+
+      return `Hello! While my primary AI systems are currently running through updates, I hear you loud and clear: you would like to bypass recommendations and create a support ticket directly.
+
+No problem! I have set up your ticket draft using your request details. 
+
+Please click the button below to submit this support ticket directly to our ICT staff:
+
+\`\`\`ticket-data
+{
+  "title": "${title}",
+  "description": "User requested ticket creation via chat help desk: '${message.replace(/"/g, '\\"')}'",
+  "type": "${type}",
+  "priority": "MEDIUM",
+  "category": "${category}",
+  "staffNote": "⚠️ Created via urgent chat fallback — please clarify details with the user."
+}
+\`\`\`
+
+If you'd like to adjust or add anything, let me know!`;
+    }
+
+    const cleanedContext = this.cleanFallbackContext(contextData);
+
+    if (cleanedContext.trim()) {
+      return `Hello! Our primary AI systems are currently running through updates, but I've searched our knowledge archives and found these matching resources that might help you solve ${message.toLowerCase().includes("password") ? "this password issue" : "this issue"} right away:\n\n${cleanedContext}\n\nIf those details don't resolve the issue, would you like me to open a support ticket for our ICT support team to take a hands-on look? Just describe what you need, and I'll queue it up for you!`;
+    }
+
+    return "Hello! Our AI systems are currently resting, but I'd be happy to help you raise a support ticket. To get started, could you describe what problem you are facing, when it started, and which system is affected?";
+  }
+
+  private cleanFallbackContext(contextData: string): string {
+    const lines = contextData.split("\n");
+    let inAllowedSection = false;
+    let allowedContent = "";
+
+    for (const line of lines) {
+      if (line.startsWith("--- ")) {
+        const sectionName = line.replace(/---/g, "").trim();
+        if (
+          sectionName === "KNOWLEDGE BASE ARTICLES" ||
+          sectionName === "TROUBLESHOOTING SOLUTIONS" ||
+          sectionName === "RESOLVED TICKETS (similar issues)"
+        ) {
+          inAllowedSection = true;
+          allowedContent += `\n### 📖 ${sectionName === "KNOWLEDGE BASE ARTICLES" ? "Knowledge Guides" : "Related Solutions"}\n`;
+        } else {
+          inAllowedSection = false;
+        }
+        continue;
+      }
+
+      if (inAllowedSection) {
+        allowedContent += line + "\n";
+      }
+    }
+
+    let clean = allowedContent.trim();
+    // Transform knowledge base items into beautiful user-facing titles
+    clean = clean.replace(
+      /\[Article ID:\s*(\d+)\]\s*Title:\s*(.+)/g,
+      "**$2** (Link: [KB: $2](kb:$1))",
+    );
+    // Clean trailing metadata tags
+    clean = clean.replace(/^\s*Category:\s*.+$/gm, "");
+    clean = clean.replace(/^\s*Relevance:\s*.+$/gm, "");
+    clean = clean.replace(/^\s*Link format:\s*.+$/gm, "");
+    // Collapse excess newlines gracefully
+    clean = clean.replace(/\n{3,}/g, "\n\n");
+
+    return clean.trim();
+  }
+
+  // ========================================
+  // TICKET CREATION FROM CHAT
+  // ========================================
+
+  /** Normalize AI-generated category to valid MISCategory enum value */
+  private normalizeMISCategory(category: string | undefined): string {
+    const valid: Record<string, string> = {
+      website: "WEBSITE",
+      software: "SOFTWARE",
+    };
+    const key = (category || "").toLowerCase().trim();
+    return valid[key] || "SOFTWARE";
+  }
+
+  async createTicketFromChat(
+    sessionId: number,
+    userId: number,
+    ticketData: {
+      title: string;
+      description: string;
+      type: "MIS" | "ITS";
+      priority?: string;
+      category?: string;
+      staffNote?: string;
+    },
+  ) {
+    // Verify session
+    const session = await prisma.chatSession.findUnique({
+      where: { id: sessionId },
+    });
+    if (!session || session.userId !== userId) {
+      throw new Error("Chat session not found");
+    }
+
+    // Import ticket service dynamically to avoid circular deps
+    const { TicketService } =
+      await import("../tickets/services/ticket.service");
+    const ticketSvc = new TicketService(prisma);
+
+    let ticket: any;
+    if (ticketData.type === "MIS") {
+      ticket = await ticketSvc.createMISTicket(
+        {
+          type: "MIS" as any,
+          title: ticketData.title,
+          description: ticketData.description,
+          priority: (ticketData.priority || "MEDIUM") as any,
+          category: this.normalizeMISCategory(ticketData.category) as any,
+          controlNumber: "",
+        },
+        userId,
+      );
+    } else {
+      ticket = await ticketSvc.createITSTicket(
+        {
+          type: "ITS" as any,
+          title: ticketData.title,
+          description: ticketData.description,
+          priority: (ticketData.priority || "MEDIUM") as any,
+        },
+        userId,
+      );
+    }
+
+    // Auto-add staffNote as internal TicketNote if provided
+    if (ticketData.staffNote?.trim()) {
+      try {
+        await ticketSvc.addNote(ticket.id, userId, {
+          content: ticketData.staffNote.trim(),
+          isInternal: true,
+        });
+      } catch (err: any) {
+        logger.error(
+          `[ChatService] Failed to add staff note to ticket ${ticket.id}: ${err.message}`,
+        );
+        // Don't fail ticket creation if note fails — ticket is already created
+      }
+    }
+
+    // Update session status
+    await prisma.chatSession.update({
+      where: { id: sessionId },
+      data: {
+        status: "TICKET_CREATED",
+        ticketId: ticket.id,
+      },
+    });
+
+    // Save system message about ticket creation
+    await prisma.chatMessage.create({
+      data: {
+        sessionId,
+        role: "SYSTEM",
+        content: `Ticket ${ticket.ticketNumber} has been created successfully.`,
+        metadata: JSON.stringify({
+          ticketId: ticket.id,
+          ticketNumber: ticket.ticketNumber,
+        }),
+      },
+    });
+
+    return ticket;
+  }
+
+  // ========================================
+  // HEALTH METRICS
+  // ========================================
+
+  async getHealthMetrics(days: number) {
+    const now = new Date();
+    const fromDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+    const messages = await prisma.chatMessage.findMany({
+      where: {
+        role: "ASSISTANT",
+        createdAt: { gte: fromDate },
+        metadata: { not: null },
+      },
+      select: { metadata: true },
+    });
+
+    const providerMap = new Map<
+      string,
+      {
+        messageCount: number;
+        fallbackCount: number;
+        failureCount: number;
+        totalDurationMs: number;
+        durationCount: number;
+      }
+    >();
+
+    let totalFallbacks = 0;
+    let totalFailures = 0;
+    let totalDurationMs = 0;
+    let durationCount = 0;
+
+    for (const msg of messages) {
+      if (!msg.metadata) continue;
+      try {
+        const meta = JSON.parse(msg.metadata);
+        const provider = meta.provider || "unknown";
+        const isFallback = meta.fallback === true;
+        const durationMs = meta.durationMs;
+
+        let entry = providerMap.get(provider);
+        if (!entry) {
+          entry = { messageCount: 0, fallbackCount: 0, failureCount: 0, totalDurationMs: 0, durationCount: 0 };
+          providerMap.set(provider, entry);
+        }
+        entry.messageCount++;
+        if (isFallback) {
+          entry.fallbackCount++;
+          totalFallbacks++;
+        }
+        if (typeof durationMs === "number") {
+          entry.totalDurationMs += durationMs;
+          entry.durationCount++;
+          totalDurationMs += durationMs;
+          durationCount++;
+        }
+      } catch {
+        // Malformed metadata — skip
+      }
+    }
+
+    const providerUsage = Array.from(providerMap.entries())
+      .map(([provider, data]) => ({
+        provider,
+        messageCount: data.messageCount,
+        fallbackCount: data.fallbackCount,
+        failureCount: data.failureCount,
+        averageResponseTimeMs:
+          data.durationCount > 0
+            ? Math.round((data.totalDurationMs / data.durationCount) * 100) / 100
+            : null,
+      }))
+      .sort((a, b) => b.messageCount - a.messageCount);
+
+    return {
+      totalMessages: messages.length,
+      providerUsage,
+      totalFallbacks,
+      totalFailures,
+      averageResponseTimeMs:
+        durationCount > 0
+          ? Math.round((totalDurationMs / durationCount) * 100) / 100
+          : null,
+      fromDate: fromDate.toISOString(),
+      toDate: now.toISOString(),
+    };
+  }
+
+  async getPromptVersionStats(days: number) {
+    const now = new Date();
+    const fromDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+    const messages = await prisma.chatMessage.findMany({
+      where: {
+        role: "ASSISTANT",
+        createdAt: { gte: fromDate },
+        metadata: { not: null },
+      },
+      select: { metadata: true },
+    });
+
+    const versionMap = new Map<
+      string,
+      { messageCount: number; totalDurationMs: number; durationCount: number }
+    >();
+
+    for (const msg of messages) {
+      if (!msg.metadata) continue;
+      try {
+        const meta = JSON.parse(msg.metadata);
+        const version = meta.promptVersion || "unknown";
+        const durationMs = meta.durationMs;
+
+        let entry = versionMap.get(version);
+        if (!entry) {
+          entry = { messageCount: 0, totalDurationMs: 0, durationCount: 0 };
+          versionMap.set(version, entry);
+        }
+        entry.messageCount++;
+        if (typeof durationMs === "number") {
+          entry.totalDurationMs += durationMs;
+          entry.durationCount++;
+        }
+      } catch {
+        // Malformed metadata — skip
+      }
+    }
+
+    return Array.from(versionMap.entries())
+      .map(([promptVersion, data]) => ({
+        promptVersion,
+        messageCount: data.messageCount,
+        averageResponseTimeMs:
+          data.durationCount > 0
+            ? Math.round((data.totalDurationMs / data.durationCount) * 100) / 100
+            : null,
+      }))
+      .sort((a, b) => b.messageCount - a.messageCount);
+  }
+}
+
+export const chatService = new ChatService();
