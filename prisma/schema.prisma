@@ -104,6 +104,7 @@ model UserSkill {
   @@unique([userId, skill])
   @@index([userId])
   @@index([skill])
+  @@map("userskill")
 }
 
 model Ticket {
@@ -178,6 +179,7 @@ model Ticket {
   @@index([type, status])
   @@index([dueDate, status])
   @@fulltext([title, description])
+  @@map("ticket")
 }
 
 model MISTicket {
@@ -198,6 +200,8 @@ model MISTicket {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@map("misticket")
 }
 
 model ITSTicket {
@@ -217,6 +221,8 @@ model ITSTicket {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@map("itsticket")
 }
 
 model TicketAssignment {
@@ -231,6 +237,7 @@ model TicketAssignment {
 
   @@unique([ticketId, userId])
   @@index([userId])
+  @@map("ticketassignment")
 }
 
 model TicketNote {
@@ -249,6 +256,7 @@ model TicketNote {
 
   @@index([ticketId])
   @@index([userId])
+  @@map("ticketnote")
 }
 
 model TicketAttachment {
@@ -295,6 +303,7 @@ model TicketStatusHistory {
   @@index([ticketId])
   @@index([ticketId, userId])
   @@index([createdAt])
+  @@map("ticketstatushistory")
 }
 
 model TicketCounter {
@@ -304,6 +313,7 @@ model TicketCounter {
   counter Int @default(0)
 
   @@unique([year, month])
+  @@map("ticketcounter")
 }
 
 // ========================================
@@ -352,6 +362,7 @@ model Notification {
   @@index([userId, isRead])
   @@index([ticketId])
   @@index([createdAt])
+  @@map("notification")
 }
 
 // ========================================
@@ -388,6 +399,7 @@ model KnowledgeArticle {
   @@index([createdById])
   @@index([createdAt])
   @@fulltext([title, content])
+  @@map("knowledgearticle")
 }
 
 // ========================================
@@ -422,6 +434,7 @@ model ChatSession {
   @@index([userId])
   @@index([status])
   @@index([createdAt])
+  @@map("chatsession")
 }
 
 model ChatMessage {
@@ -436,6 +449,7 @@ model ChatMessage {
 
   @@index([sessionId])
   @@index([createdAt])
+  @@map("chatmessage")
 }
 
 // ========================================
@@ -465,6 +479,7 @@ model TroubleshootingSolution {
   @@index([createdById])
   @@index([createdAt])
   @@fulltext([problem, solution])
+  @@map("troubleshootingsolution")
 }
 
 // ========================================
@@ -517,4 +532,5 @@ model ClientSatisfactionSurvey {
   @@index([ticketId])
   @@index([userId])
   @@index([createdAt])
+  @@map("clientsatisfactionsurvey")
 }
