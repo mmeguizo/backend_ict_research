@@ -18,6 +18,7 @@ export const config = {
       "https://10.100.168.9:4201",
       "http://10.100.168.9:4201",
       "https://10.100.168.9:55001",
+      "https://frontend-ict-research-7k53ed322-mmeguizos-projects.vercel.app",
     ],
     credentials: true,
   },
@@ -47,8 +48,6 @@ export const config = {
     // How long to wait for a single provider before trying the next one.
     // Default 45s is generous enough for free-tier Hugging Face cold starts
     // but short enough to fail over before the frontend gives up.
-    requestTimeoutMs: Number(
-      process.env.AI_REQUEST_TIMEOUT_MS || 45000,
-    ),
+    requestTimeoutMs: Number(process.env.AI_REQUEST_TIMEOUT_MS || 45000),
   },
 };
