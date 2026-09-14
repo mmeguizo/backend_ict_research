@@ -20,7 +20,7 @@ export const config = {
       "https://10.100.168.9:55001",
       "https://frontend-ict-research-7k53ed322-mmeguizos-projects.vercel.app",
       "https://frontend-ict-research-mbcdxjd4c-mmeguizos-projects.vercel.app",
-      "https://frontend-ict-research.vercel.app/login",
+      "https://frontend-ict-research.vercel.app",
     ],
     credentials: true,
   },
