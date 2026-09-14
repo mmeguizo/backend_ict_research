@@ -92,6 +92,7 @@ model User {
 
   @@index([role])
   @@index([isActive])
+  @@map("user")
 }
 
 model UserSkill {
